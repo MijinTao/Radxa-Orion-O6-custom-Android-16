@@ -1,0 +1,96 @@
+diff --git a/res/values/dmod_mouse_touch_strings.xml b/res/values/dmod_mouse_touch_strings.xml
+new file mode 100644
+index 0000000..d62bb33
+--- /dev/null
++++ b/res/values/dmod_mouse_touch_strings.xml
+@@ -0,0 +1,6 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- dmod: mouse click as touch -->
++<resources>
++    <string name="dmod_mouse_click_as_touch" translatable="false">Mouse click as touch</string>
++    <string name="dmod_mouse_click_as_touch_summary" translatable="false">Send left mouse clicks and drags to apps as finger taps and swipes</string>
++</resources>
+diff --git a/res/xml/development_settings.xml b/res/xml/development_settings.xml
+index fa8716f..16b1e88 100644
+--- a/res/xml/development_settings.xml
++++ b/res/xml/development_settings.xml
+@@ -532,6 +532,12 @@
+             android:title="@string/show_touches"
+             android:summary="@string/show_touches_summary" />
+ 
++        <!-- dmod: mouse click as touch -->
++        <SwitchPreferenceCompat
++            android:key="dmod_mouse_click_as_touch"
++            android:title="@string/dmod_mouse_click_as_touch"
++            android:summary="@string/dmod_mouse_click_as_touch_summary" />
++
+         <SwitchPreferenceCompat
+             android:key="pointer_location"
+             android:title="@string/pointer_location"
+diff --git a/src/com/android/settings/development/DevelopmentSettingsDashboardFragment.java b/src/com/android/settings/development/DevelopmentSettingsDashboardFragment.java
+index ce81b65..958a79e 100644
+--- a/src/com/android/settings/development/DevelopmentSettingsDashboardFragment.java
++++ b/src/com/android/settings/development/DevelopmentSettingsDashboardFragment.java
+@@ -772,6 +772,7 @@ public class DevelopmentSettingsDashboardFragment extends RestrictedDashboardFra
+         controllers.add(new NfcSnoopLogPreferenceController(context, fragment));
+         controllers.add(new NfcVerboseVendorLogPreferenceController(context, fragment));
+         controllers.add(new ShowTapsPreferenceController(context));
++        controllers.add(new MouseClickAsTouchPreferenceController(context)); // dmod: mouse click as touch
+         controllers.add(new PointerLocationPreferenceController(context));
+         controllers.add(new ShowKeyPressesPreferenceController(context));
+         controllers.add(new TouchpadVisualizerPreferenceController(context));
+diff --git a/src/com/android/settings/development/MouseClickAsTouchPreferenceController.java b/src/com/android/settings/development/MouseClickAsTouchPreferenceController.java
+new file mode 100644
+index 0000000..91420df
+--- /dev/null
++++ b/src/com/android/settings/development/MouseClickAsTouchPreferenceController.java
+@@ -0,0 +1,49 @@
++/*
++ * dmod: mouse click as touch.
++ * Developer option: deliver left mouse button clicks and drags to apps as finger touches.
++ * Backed by Settings.Global "dmod_mouse_click_as_touch" (observed by InputSettingsObserver).
++ */
++package com.android.settings.development;
++
++import android.content.Context;
++import android.provider.Settings;
++
++import androidx.preference.Preference;
++import androidx.preference.TwoStatePreference;
++
++import com.android.settings.core.PreferenceControllerMixin;
++import com.android.settingslib.development.DeveloperOptionsPreferenceController;
++
++public class MouseClickAsTouchPreferenceController extends DeveloperOptionsPreferenceController
++        implements Preference.OnPreferenceChangeListener, PreferenceControllerMixin {
++
++    private static final String KEY = "dmod_mouse_click_as_touch";
++
++    public MouseClickAsTouchPreferenceController(Context context) {
++        super(context);
++    }
++
++    @Override
++    public String getPreferenceKey() {
++        return KEY;
++    }
++
++    @Override
++    public boolean onPreferenceChange(Preference preference, Object newValue) {
++        Settings.Global.putInt(mContext.getContentResolver(), KEY, (Boolean) newValue ? 1 : 0);
++        return true;
++    }
++
++    @Override
++    public void updateState(Preference preference) {
++        ((TwoStatePreference) mPreference).setChecked(
++                Settings.Global.getInt(mContext.getContentResolver(), KEY, 0) != 0);
++    }
++
++    @Override
++    protected void onDeveloperOptionsSwitchDisabled() {
++        super.onDeveloperOptionsSwitchDisabled();
++        Settings.Global.putInt(mContext.getContentResolver(), KEY, 0);
++        ((TwoStatePreference) mPreference).setChecked(false);
++    }
++}

@@ -1,0 +1,45 @@
+diff --git a/sky1/sky1_orion_o6/BoardConfig.mk b/sky1/sky1_orion_o6/BoardConfig.mk
+index 6a7c492..6a9773b 100644
+--- a/sky1/sky1_orion_o6/BoardConfig.mk
++++ b/sky1/sky1_orion_o6/BoardConfig.mk
+@@ -111,7 +111,7 @@ BOARD_BOOTCONFIG += androidboot.console=ttyAMA2 androidboot.hardware=cix android
+ 
+ BOARD_BOOTCONFIG += androidboot.fstab_suffix=cix androidboot.android_dt_dir=/proc/device-tree/firmware/android/ androidboot.dtbo_idx=0
+ 
+-BOARD_BOOTCONFIG += androidboot.btmacaddr=11:0c:20:00:ce:ee androidboot.wificountrycode=CN
++BOARD_BOOTCONFIG += androidboot.btmacaddr=11:0c:20:00:ce:ee androidboot.wificountrycode=IT
+ 
+ ifneq (,$(filter userdebug eng,$(TARGET_BUILD_VARIANT)))
+ BOARD_BOOTCONFIG += androidboot.vendor.sysrq=1
+@@ -149,10 +149,15 @@ BOARD_WIFI_VENDOR := realtek
+ ifeq ($(BOARD_WIFI_VENDOR), realtek)
+     WPA_SUPPLICANT_VERSION := VER_0_8_X
+     BOARD_WPA_SUPPLICANT_DRIVER := NL80211
+-    BOARD_WPA_SUPPLICANT_PRIVATE_LIB := lib_driver_cmd_rtl
++    # BOARD_WPA_SUPPLICANT_PRIVATE_LIB := lib_driver_cmd_rtl  # not in the Android 16 manifest
++    BOARD_WPA_SUPPLICANT_PRIVATE_LIB := lib_driver_cmd_simulated_cf_bp
+     BOARD_HOSTAPD_DRIVER := NL80211
+-    BOARD_HOSTAPD_PRIVATE_LIB := lib_driver_cmd_rtl
+-    BOARD_WLAN_DEVICE := realtek
++    # BOARD_HOSTAPD_PRIVATE_LIB := lib_driver_cmd_rtl  # not in the Android 16 manifest
++    BOARD_HOSTAPD_PRIVATE_LIB := lib_driver_cmd_simulated_cf_bp
++    # BOARD_WLAN_DEVICE := realtek  # libwifi-hal-rtk is not in the Android 16 manifest (android-manifest#1)
++    # Generic nl80211 Wi-Fi HAL (libwifi-hal-emu) + lib_driver_cmd_simulated_cf_bp for wpa_supplicant/hostapd.
++    # Without this, the stub libwifi-hal-fallback is linked and the Wi-Fi HAL refuses to start.
++    BOARD_WLAN_DEVICE := emulator
+ endif
+ WIFI_HIDL_FEATURE_DUAL_INTERFACE := true
+ 
+diff --git a/sky1/sky1_orion_o6/sky1_orion_o6.mk b/sky1/sky1_orion_o6/sky1_orion_o6.mk
+index 5c9b630..a4cf232 100644
+--- a/sky1/sky1_orion_o6/sky1_orion_o6.mk
++++ b/sky1/sky1_orion_o6/sky1_orion_o6.mk
+@@ -454,3 +454,8 @@ PRODUCT_PACKAGES += \
+ PRODUCT_PACKAGES += \
+     android.hidl.allocator@1.0-service \
+     android.hidl.memory@1.0-impl
++
++# Android 16 dropped the "wpa_supplicant.conf" module listed in PRODUCT_PACKAGES above, so install the
++# AOSP template directly. Without it wpa_supplicant refuses to add wlan0 and Wi-Fi turns itself off.
++PRODUCT_COPY_FILES += \
++    external/wpa_supplicant_8/wpa_supplicant/wpa_supplicant_template.conf:$(TARGET_COPY_OUT_VENDOR)/etc/wifi/wpa_supplicant.conf
