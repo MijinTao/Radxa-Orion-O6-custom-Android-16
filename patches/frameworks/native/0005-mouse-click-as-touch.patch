@@ -1,0 +1,150 @@
+diff --git a/services/inputflinger/PointerChoreographer.cpp b/services/inputflinger/PointerChoreographer.cpp
+index 6089bf2..8fbf8fe 100644
+--- a/services/inputflinger/PointerChoreographer.cpp
++++ b/services/inputflinger/PointerChoreographer.cpp
+@@ -219,7 +219,10 @@ void PointerChoreographer::notifyKey(const NotifyKeyArgs& args) {
+ void PointerChoreographer::notifyMotion(const NotifyMotionArgs& args) {
+     NotifyMotionArgs newArgs = processMotion(args);
+ 
+-    mNextListener.notify(newArgs);
++    // dmod: mouse click as touch
++    for (const NotifyMotionArgs& outArgs : dmodMouseClickAsTouch(newArgs)) {
++        mNextListener.notify(outArgs);
++    }
+ }
+ 
+ void PointerChoreographer::fadeMouseCursorOnKeyPress(const android::NotifyKeyArgs& args) {
+@@ -578,6 +581,8 @@ void PointerChoreographer::processDeviceReset(const NotifyDeviceResetArgs& args)
+     mTouchPointersByDevice.erase(args.deviceId);
+     mStylusPointersByDevice.erase(args.deviceId);
+     mDrawingTabletPointersByDevice.erase(args.deviceId);
++    mDmodTouchingMice.erase(args.deviceId);  // dmod: mouse click as touch
++    mDmodHoveringMice.erase(args.deviceId);
+     onControllerAddedOrRemovedLocked();
+ }
+ 
+@@ -669,6 +674,8 @@ void PointerChoreographer::dump(std::string& dump) {
+     dump += "PointerChoreographer:\n";
+     dump += StringPrintf(INDENT "Show Touches Enabled: %s\n",
+                          mShowTouchesEnabled ? "true" : "false");
++    dump += StringPrintf(INDENT "Mouse Click As Touch (dmod): %s\n",
++                         mDmodMouseClickAsTouchEnabled ? "true" : "false");
+     dump += StringPrintf(INDENT "Stylus PointerIcon Enabled: %s\n",
+                          mStylusPointerIconEnabled ? "true" : "false");
+     dump += StringPrintf(INDENT "Accessibility Pointer Motion Filter Enabled: %s\n",
+@@ -938,6 +945,81 @@ void PointerChoreographer::setShowTouchesEnabled(bool enabled) {
+     notifyPointerDisplayChange(pointerDisplayChange, mPolicy);
+ }
+ 
++
++// dmod: mouse click as touch -----------------------------------------------------------------
++// A mouse gesture that starts with the primary (left) button is re-sourced as a single-finger
++// touchscreen gesture: DOWN/MOVE/UP/CANCEL become touch events at the cursor position,
++// BUTTON_PRESS/BUTTON_RELEASE (and scrolls during the gesture) are dropped, and an open hover
++// stream is closed with HOVER_EXIT first so the dispatcher sees consistent streams per device.
++// The cursor itself is still moved and drawn by processMouseEventLocked() before this runs.
++void PointerChoreographer::setMouseClickAsTouchEnabled(bool enabled) {
++    std::scoped_lock _l(getLock());
++    mDmodMouseClickAsTouchEnabled = enabled;
++}
++
++static NotifyMotionArgs dmodToTouch(const NotifyMotionArgs& args) {
++    NotifyMotionArgs t(args);
++    t.source = AINPUT_SOURCE_TOUCHSCREEN;
++    t.pointerProperties[0].toolType = ToolType::FINGER;
++    t.pointerProperties[0].id = 0;
++    t.buttonState = 0;
++    t.actionButton = 0;
++    t.xCursorPosition = AMOTION_EVENT_INVALID_CURSOR_POSITION;
++    t.yCursorPosition = AMOTION_EVENT_INVALID_CURSOR_POSITION;
++    t.pointerCoords[0].setAxisValue(AMOTION_EVENT_AXIS_PRESSURE, 1.0f);
++    t.pointerCoords[0].setAxisValue(AMOTION_EVENT_AXIS_RELATIVE_X, 0.0f);
++    t.pointerCoords[0].setAxisValue(AMOTION_EVENT_AXIS_RELATIVE_Y, 0.0f);
++    return t;
++}
++
++std::vector<NotifyMotionArgs> PointerChoreographer::dmodMouseClickAsTouch(
++        const NotifyMotionArgs& args) {
++    std::scoped_lock _l(getLock());
++    if (args.getPointerCount() != 1 ||
++        !isFromMouse(args.source, args.pointerProperties[0].toolType)) {
++        return {args};
++    }
++    const DeviceId dev = args.deviceId;
++    const int32_t action = MotionEvent::getActionMasked(args.action);
++
++    if (mDmodTouchingMice.count(dev) == 0) {
++        if (mDmodMouseClickAsTouchEnabled && action == AMOTION_EVENT_ACTION_DOWN &&
++            (args.buttonState & AMOTION_EVENT_BUTTON_PRIMARY) != 0) {
++            std::vector<NotifyMotionArgs> out;
++            if (mDmodHoveringMice.erase(dev) > 0) {
++                NotifyMotionArgs exitArgs(args);
++                exitArgs.id = mDmodIdGenerator.nextId();
++                exitArgs.action = AMOTION_EVENT_ACTION_HOVER_EXIT;
++                exitArgs.actionButton = 0;
++                exitArgs.buttonState = 0;
++                out.push_back(exitArgs);
++            }
++            out.push_back(dmodToTouch(args));
++            mDmodTouchingMice.insert(dev);
++            return out;
++        }
++        // Plain mouse event: pass through, remember whether a hover stream is open.
++        if (action == AMOTION_EVENT_ACTION_HOVER_ENTER || action == AMOTION_EVENT_ACTION_HOVER_MOVE) {
++            mDmodHoveringMice.insert(dev);
++        } else if (action == AMOTION_EVENT_ACTION_HOVER_EXIT || action == AMOTION_EVENT_ACTION_DOWN) {
++            mDmodHoveringMice.erase(dev);
++        }
++        return {args};
++    }
++
++    // A converted gesture is in progress for this mouse (kept until UP even if toggled off).
++    switch (action) {
++        case AMOTION_EVENT_ACTION_MOVE:
++            return {dmodToTouch(args)};
++        case AMOTION_EVENT_ACTION_UP:
++        case AMOTION_EVENT_ACTION_CANCEL:
++            mDmodTouchingMice.erase(dev);
++            return {dmodToTouch(args)};
++        default:  // BUTTON_PRESS / BUTTON_RELEASE / SCROLL while "touching"
++            return {};
++    }
++}
++
+ void PointerChoreographer::setStylusPointerIconEnabled(bool enabled) {
+     PointerDisplayChange pointerDisplayChange;
+ 
+diff --git a/services/inputflinger/PointerChoreographer.h b/services/inputflinger/PointerChoreographer.h
+index 67bdca1..4e5109d 100644
+--- a/services/inputflinger/PointerChoreographer.h
++++ b/services/inputflinger/PointerChoreographer.h
+@@ -62,6 +62,8 @@ public:
+             ui::LogicalDisplayId associatedDisplayId = ui::LogicalDisplayId::INVALID) = 0;
+     virtual vec2 getMouseCursorPosition(ui::LogicalDisplayId displayId) = 0;
+     virtual void setShowTouchesEnabled(bool enabled) = 0;
++    // dmod: mouse click as touch: deliver left-button mouse gestures as finger touches.
++    virtual void setMouseClickAsTouchEnabled(bool /*enabled*/) {}
+     virtual void setStylusPointerIconEnabled(bool enabled) = 0;
+     /**
+      * Set the icon that is shown for the given pointer. The request may fail in some cases, such
+@@ -109,6 +111,7 @@ public:
+             ui::LogicalDisplayId associatedDisplayId) override;
+     vec2 getMouseCursorPosition(ui::LogicalDisplayId displayId) override;
+     void setShowTouchesEnabled(bool enabled) override;
++    void setMouseClickAsTouchEnabled(bool enabled) override;
+     void setStylusPointerIconEnabled(bool enabled) override;
+     bool setPointerIcon(std::variant<std::unique_ptr<SpriteIcon>, PointerIconStyle> icon,
+                         ui::LogicalDisplayId displayId, DeviceId deviceId) override;
+@@ -242,6 +245,12 @@ private:
+     std::set<DeviceId> mMouseDevices GUARDED_BY(getLock());
+     std::vector<DisplayViewport> mViewports GUARDED_BY(getLock());
+     bool mShowTouchesEnabled GUARDED_BY(getLock());
++    // dmod: mouse click as touch
++    bool mDmodMouseClickAsTouchEnabled GUARDED_BY(getLock()) = false;
++    std::set<DeviceId> mDmodTouchingMice GUARDED_BY(getLock());  // left button down, sent as touch
++    std::set<DeviceId> mDmodHoveringMice GUARDED_BY(getLock());  // hover stream open at the dispatcher
++    IdGenerator mDmodIdGenerator{IdGenerator::Source::OTHER};
++    std::vector<NotifyMotionArgs> dmodMouseClickAsTouch(const NotifyMotionArgs& args);
+     bool mStylusPointerIconEnabled GUARDED_BY(getLock());
+     bool mPointerMotionFilterEnabled GUARDED_BY(getLock());
+     std::set<ui::LogicalDisplayId /*displayId*/> mDisplaysWithPointersHidden;

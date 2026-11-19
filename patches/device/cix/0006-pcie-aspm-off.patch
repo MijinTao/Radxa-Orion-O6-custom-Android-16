@@ -1,0 +1,15 @@
+diff --git a/sky1/sky1_orion_o6/android_addition_defconfig b/sky1/sky1_orion_o6/android_addition_defconfig
+index b0f6413..a2f0ba0 100644
+--- a/sky1/sky1_orion_o6/android_addition_defconfig
++++ b/sky1/sky1_orion_o6/android_addition_defconfig
+@@ -29,3 +29,10 @@ CONFIG_BT_HCIBTUSB_BCM=y
+ # CONFIG_BT_HCIBTUSB_AUTOSUSPEND is not set
+ CONFIG_BT_RTL=m
+ CONFIG_BT_INTEL=m
++
++# Orion O6 PCIe ASPM fix: default ASPM policy "performance" = ASPM off on all PCIe links (L1 on the NVMe/Wi-Fi/r8126
++# links hung the board; same as Radxa's Android 1.0.0 BIOS default "ASPM Disable").
++# CONFIG_PCIEASPM_DEFAULT is not set
++# CONFIG_PCIEASPM_POWERSAVE is not set
++# CONFIG_PCIEASPM_POWER_SUPERSAVE is not set
++CONFIG_PCIEASPM_PERFORMANCE=y

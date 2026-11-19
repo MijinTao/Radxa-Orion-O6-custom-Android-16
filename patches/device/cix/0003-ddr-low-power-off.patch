@@ -1,0 +1,14 @@
+diff --git a/sky1/sky1_orion_o6/init.rc b/sky1/sky1_orion_o6/init.rc
+index 12a9eff..712eabc 100644
+--- a/sky1/sky1_orion_o6/init.rc
++++ b/sky1/sky1_orion_o6/init.rc
+@@ -279,3 +279,9 @@ on property:ro.boot.vendor.sysrq=1
+ # setenv append_bootargs androidboot.usb.debugging=1
+ on property:ro.boot.usb.debugging=1
+     setprop persist.sys.usb.config adb
++
++# Orion O6: turn off the firmware's DDR low-power mode as early as possible. With it on, sustained
++# CPU/GPU load makes the SCP firmware stop answering SCMI requests and the board freezes, resets or
++# powers off. (cix-ddr-lp is built into the kernel, so the node exists before init starts.)
++on early-init
++    write /sys/devices/platform/cix_ddr_lp/on 0

@@ -1,0 +1,94 @@
+diff --git a/services/core/java/com/android/server/input/InputSettingsObserver.java b/services/core/java/com/android/server/input/InputSettingsObserver.java
+index d1f07cb..e5425c1 100644
+--- a/services/core/java/com/android/server/input/InputSettingsObserver.java
++++ b/services/core/java/com/android/server/input/InputSettingsObserver.java
+@@ -94,6 +94,9 @@ class InputSettingsObserver extends ContentObserver {
+                         (reason) -> updateTouchpadAccelerationEnabled()),
+                 Map.entry(Settings.System.getUriFor(Settings.System.SHOW_TOUCHES),
+                         (reason) -> updateShowTouches()),
++                // dmod: mouse click as touch
++                Map.entry(Settings.Global.getUriFor("dmod_mouse_click_as_touch"),
++                        (reason) -> updateMouseClickAsTouch()),
+                 Map.entry(Settings.System.getUriFor(Settings.System.POINTER_LOCATION),
+                         (reason) -> updatePointerLocation()),
+                 Map.entry(
+@@ -248,6 +251,11 @@ class InputSettingsObserver extends ContentObserver {
+                 InputSettings.isTouchpadAccelerationEnabled(mContext));
+     }
+ 
++    private void updateMouseClickAsTouch() {
++        mNative.setMouseClickAsTouch(Settings.Global.getInt(mContext.getContentResolver(),
++                "dmod_mouse_click_as_touch", 0) != 0);
++    }
++
+     private void updateShowTouches() {
+         mNative.setShowTouches(getBoolean(Settings.System.SHOW_TOUCHES, false));
+     }
+diff --git a/services/core/java/com/android/server/input/NativeInputManagerService.java b/services/core/java/com/android/server/input/NativeInputManagerService.java
+index de54cd8..bd142ae 100644
+--- a/services/core/java/com/android/server/input/NativeInputManagerService.java
++++ b/services/core/java/com/android/server/input/NativeInputManagerService.java
+@@ -162,6 +162,9 @@ interface NativeInputManagerService {
+ 
+     void setShowTouches(boolean enabled);
+ 
++    /** dmod: mouse click as touch */
++    void setMouseClickAsTouch(boolean enabled);
++
+     void setNonInteractiveDisplays(int[] displayIds);
+ 
+     void reloadCalibration();
+@@ -483,6 +486,9 @@ interface NativeInputManagerService {
+         @Override
+         public native void setShowTouches(boolean enabled);
+ 
++        @Override
++        public native void setMouseClickAsTouch(boolean enabled);
++
+         @Override
+         public native void setNonInteractiveDisplays(int[] displayIds);
+ 
+diff --git a/services/core/jni/com_android_server_input_InputManagerService.cpp b/services/core/jni/com_android_server_input_InputManagerService.cpp
+index ee7c936..af4e67d 100644
+--- a/services/core/jni/com_android_server_input_InputManagerService.cpp
++++ b/services/core/jni/com_android_server_input_InputManagerService.cpp
+@@ -360,6 +360,7 @@ public:
+     void setTouchpadAccelerationEnabled(bool enabled);
+     void setInputDeviceEnabled(uint32_t deviceId, bool enabled);
+     void setShowTouches(bool enabled);
++    void setMouseClickAsTouch(bool enabled); // dmod: mouse click as touch
+     void setNonInteractiveDisplays(const std::set<ui::LogicalDisplayId>& displayIds);
+     void reloadCalibration();
+     void reloadPointerIcons();
+@@ -1705,6 +1706,10 @@ void NativeInputManager::setShowTouches(bool enabled) {
+     mInputManager->getChoreographer().setShowTouchesEnabled(enabled);
+ }
+ 
++void NativeInputManager::setMouseClickAsTouch(bool enabled) {
++    mInputManager->getChoreographer().setMouseClickAsTouchEnabled(enabled);
++}
++
+ void NativeInputManager::requestPointerCapture(const sp<IBinder>& windowToken, bool enabled) {
+     mInputManager->getDispatcher().requestPointerCapture(windowToken, enabled);
+ }
+@@ -2659,6 +2664,12 @@ static void nativeSetTouchpadAccelerationEnabled(JNIEnv* env, jobject nativeImpl
+     im->setTouchpadAccelerationEnabled(enabled);
+ }
+ 
++static void nativeSetMouseClickAsTouch(JNIEnv* env, jobject nativeImplObj, jboolean enabled) {
++    NativeInputManager* im = getNativeInputManager(env, nativeImplObj);
++
++    im->setMouseClickAsTouch(enabled);
++}
++
+ static void nativeSetShowTouches(JNIEnv* env, jobject nativeImplObj, jboolean enabled) {
+     NativeInputManager* im = getNativeInputManager(env, nativeImplObj);
+ 
+@@ -3377,6 +3388,7 @@ static const JNINativeMethod gInputManagerMethods[] = {
+         {"setTouchpadSystemGesturesEnabled", "(Z)V", (void*)nativeSetTouchpadSystemGesturesEnabled},
+         {"setTouchpadAccelerationEnabled", "(Z)V", (void*)nativeSetTouchpadAccelerationEnabled},
+         {"setShowTouches", "(Z)V", (void*)nativeSetShowTouches},
++        {"setMouseClickAsTouch", "(Z)V", (void*)nativeSetMouseClickAsTouch},
+         {"setNonInteractiveDisplays", "([I)V", (void*)nativeSetNonInteractiveDisplays},
+         {"reloadCalibration", "()V", (void*)nativeReloadCalibration},
+         {"vibrate", "(I[J[III)V", (void*)nativeVibrate},

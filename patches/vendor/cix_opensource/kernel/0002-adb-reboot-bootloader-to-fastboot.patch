@@ -1,0 +1,99 @@
+diff --git a/drivers/soc/cix/Makefile b/drivers/soc/cix/Makefile
+index ae197a7..44e03f8 100755
+--- a/drivers/soc/cix/Makefile
++++ b/drivers/soc/cix/Makefile
+@@ -9,3 +9,4 @@ obj-y += cix-hibernate.o
+ obj-y += cix-ddr-lp.o
+ obj-y += cix-suspend.o
+ obj-$(CONFIG_CIX_SCHED) += sched/
++obj-y += cix-reboot-reason.o
+diff --git a/drivers/soc/cix/cix-reboot-reason.c b/drivers/soc/cix/cix-reboot-reason.c
+new file mode 100644
+index 0000000..094c82a
+--- /dev/null
++++ b/drivers/soc/cix/cix-reboot-reason.c
+@@ -0,0 +1,84 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * CIX Sky1 (Radxa Orion O6): make "reboot bootloader" boot into the firmware's fastboot mode.
++ *
++ * The UEFI driver LaunchFastbootDxe starts the fastboot app when the low byte of the reboot-reason
++ * register is 0x01 (or the boot strap selects fastboot). The firmware sets that register with the
++ * SiP call CIX_SIP_SVC_SET_REBOOT_REASON (0xc2000002); see SetRebootReason() in
++ * edk2-platforms/Silicon/CIX/Sky1/Library/RebootReasonLib. The same call is described by the
++ * "cix,reboot" device-tree node, which CIX left disabled because no kernel driver used it.
++ *
++ * This only acts on a restart whose command is exactly "bootloader" ("adb reboot bootloader").
++ * Normal reboots, shutdowns and panics are left untouched. At boot, a leftover fastboot reason
++ * (0x01) is cleared so later normal reboots don't land in fastboot again.
++ */
++#include <linux/arm-smccc.h>
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/notifier.h>
++#include <linux/of.h>
++#include <linux/reboot.h>
++#include <linux/string.h>
++
++#define CIX_SIP_SVC_SET_REBOOT_REASON	0xc2000002
++#define CIX_REBOOT_REASON_FASTBOOT	0x1
++/* PcdRebootReasonRegisterAddr in edk2-platforms/Silicon/CIX/Sky1/CixPkg.dec; readable from non-secure. */
++#define CIX_REBOOT_REASON_REG		0x16000500
++
++static u32 cix_reboot_smc_id = CIX_SIP_SVC_SET_REBOOT_REASON;
++
++static void cix_reboot_reason_clear_fastboot(void)
++{
++	struct arm_smccc_res res;
++	void __iomem *reg;
++	u32 val;
++
++	reg = ioremap(CIX_REBOOT_REASON_REG, sizeof(u32));
++	if (!reg)
++		return;
++	val = readl(reg);
++	iounmap(reg);
++
++	if ((val & 0xff) != CIX_REBOOT_REASON_FASTBOOT)
++		return;
++	arm_smccc_smc(cix_reboot_smc_id, 0, 0, 0, 0, 0, 0, 0, &res);
++	pr_info("cix-reboot-reason: cleared fastboot reboot reason (was 0x%08x, ret %ld)\n",
++		val, (long)res.a0);
++}
++
++static int cix_reboot_reason_notify(struct notifier_block *nb, unsigned long action, void *data)
++{
++	const char *cmd = data;
++	struct arm_smccc_res res;
++
++	if (action != SYS_RESTART || !cmd || strcmp(cmd, "bootloader"))
++		return NOTIFY_DONE;
++
++	arm_smccc_smc(cix_reboot_smc_id, CIX_REBOOT_REASON_FASTBOOT, 0, 0, 0, 0, 0, 0, &res);
++	pr_info("cix-reboot-reason: next boot enters fastboot (smc 0x%x, ret %ld)\n",
++		cix_reboot_smc_id, (long)res.a0);
++	return NOTIFY_DONE;
++}
++
++static struct notifier_block cix_reboot_reason_nb = {
++	.notifier_call = cix_reboot_reason_notify,
++};
++
++static int __init cix_reboot_reason_init(void)
++{
++	struct device_node *np;
++
++	/* Only on systems whose firmware describes the call (CIX Sky1); the node may be disabled. */
++	np = of_find_compatible_node(NULL, NULL, "cix,reboot");
++	if (!np)
++		return 0;
++	of_property_read_u32(np, "arm,smc-id", &cix_reboot_smc_id);
++	of_node_put(np);
++
++	cix_reboot_reason_clear_fastboot();
++	pr_info("cix-reboot-reason: \"reboot bootloader\" will enter fastboot (smc 0x%x)\n",
++		cix_reboot_smc_id);
++	return register_reboot_notifier(&cix_reboot_reason_nb);
++}
++late_initcall(cix_reboot_reason_init);

@@ -1,0 +1,31 @@
+diff --git a/drivers/soc/cix/cix-ddr-lp.c b/drivers/soc/cix/cix-ddr-lp.c
+index eb0a0ec..8dc636e 100644
+--- a/drivers/soc/cix/cix-ddr-lp.c
++++ b/drivers/soc/cix/cix-ddr-lp.c
+@@ -120,6 +120,13 @@ static const struct attribute_group ddrlp_attr_group = {
+ 	.attrs = (struct attribute **)ddrlp_attrs,
+ };
+ 
++/* ORION_O6_DDRLP_OFF: on the Radxa Orion O6, DDR low-power makes the SCP firmware stop answering SCMI
++ * requests under sustained CPU/GPU load; the board then freezes and resets or powers off.
++ * Turn it off as soon as this driver probes. Boot with cix_ddr_lp.keep_on=1 to leave it on. */
++static bool keep_on;
++module_param(keep_on, bool, 0444);
++MODULE_PARM_DESC(keep_on, "Leave the firmware's DDR low-power mode on (default: off at boot)");
++
+ static int cix_ddrlp_probe(struct platform_device *pdev)
+ {
+ 	struct cix_ddrlp_data *cix_ddrlp;
+@@ -140,6 +147,12 @@ static int cix_ddrlp_probe(struct platform_device *pdev)
+ 		return ret;
+ 	}
+ 	mutex_init(&cix_ddrlp->lock);
++
++	if (!keep_on) {
++		ret = cix_disable_ddrlp(cix_ddrlp);
++		dev_info(&pdev->dev, "DDR low-power %s at boot\n",
++			 ret ? "could NOT be turned off" : "turned off");
++	}
+ 	return 0;
+ }
+ 
