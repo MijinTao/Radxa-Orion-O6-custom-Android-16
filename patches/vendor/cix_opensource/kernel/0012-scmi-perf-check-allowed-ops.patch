@@ -1,0 +1,35 @@
+Backport from mainline Linux (CIX upstream work for the "CPU DVFS" row of the
+wiki; Sky1 CPU frequency scaling goes through the SCMI performance protocol to
+the SCP firmware): 189df98777a "firmware: arm_scmi: Check beforehand if the
+perf domain set operations are allowed" (author: xinglong.yang@cixtech.com).
+
+The firmware reports in PERF_DOMAIN_ATTRIBUTES whether Linux may set the level
+and/or the limits of each performance domain. Linux ignored that and sent
+PERF_LEVEL_SET / PERF_LIMITS_SET anyway, which the SCP then rejected. Now such
+requests fail with -EOPNOTSUPP without a round trip to the SCP, which takes load
+off the SCMI channel (the same SCP whose stalls under load patch 0003 addresses).
+
+diff --git a/drivers/firmware/arm_scmi/perf.c b/drivers/firmware/arm_scmi/perf.c
+index 096867e81..ae8ec4979 100644
+--- a/drivers/firmware/arm_scmi/perf.c
++++ b/drivers/firmware/arm_scmi/perf.c
+@@ -521,6 +521,9 @@ static int scmi_perf_limits_set(const struct scmi_protocol_handle *ph,
+ 	if (IS_ERR(dom))
+ 		return PTR_ERR(dom);
+ 
++	if (!dom->set_limits)
++		return -EOPNOTSUPP;
++
+ 	if (PROTOCOL_REV_MAJOR(pi->version) >= 0x3 && !max_perf && !min_perf)
+ 		return -EINVAL;
+ 
+@@ -671,6 +674,9 @@ static int scmi_perf_level_set(const struct scmi_protocol_handle *ph,
+ 	if (IS_ERR(dom))
+ 		return PTR_ERR(dom);
+ 
++	if (!dom->info.set_perf)
++		return -EOPNOTSUPP;
++
+ 	if (dom->level_indexing_mode) {
+ 		struct scmi_opp *opp;
+ 

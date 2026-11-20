@@ -1,0 +1,57 @@
+Backport from mainline Linux ("I2C & I3C" row of the CIX upstream wiki; the
+Sky1 I2C ports use the Cadence I2C driver, cdns,i2c-r1p14):
+f612925f989 "i2c: cadence: Add shutdown handler".
+
+On reboot/kexec an I2C transfer that is in flight (or started by a late
+shutdown path) could leave the controller with HOLD set, interrupts enabled
+and data in the FIFO, so the next kernel or the firmware found the bus busy
+and some I2C devices (USB-C PD controller, HDMI/DP helpers, sensors) did not
+answer after a warm reboot. The controller is now marked suspended (new
+transfers get -ESHUTDOWN instead of racing with the reboot) and reset.
+
+The board powers off and reboots through PSCI/SCMI, not through an I2C PMIC,
+so nothing needs I2C after the controller is shut down.
+Not ported: mainline's atomic (polled) transfer support, which needs the
+driver's clock handling reworked and has no user on the Orion O6.
+
+diff --git a/drivers/i2c/busses/i2c-cadence.c b/drivers/i2c/busses/i2c-cadence.c
+index 87c42d60e..1c46cc6f0 100644
+--- a/drivers/i2c/busses/i2c-cadence.c
++++ b/drivers/i2c/busses/i2c-cadence.c
+@@ -1623,6 +1623,28 @@ static void cdns_i2c_remove(struct platform_device *pdev)
+ 	clk_disable_unprepare(id->clk);
+ }
+ 
++/**
++ * cdns_i2c_shutdown - Prepare I2C controller for system shutdown
++ * @pdev:	Handle to the platform device structure
++ *
++ * Mark the adapter as suspended and reset the controller to ensure a clean
++ * handoff during system reboot or kexec (mainline f612925f989).
++ */
++static void cdns_i2c_shutdown(struct platform_device *pdev)
++{
++	struct cdns_i2c *id = platform_get_drvdata(pdev);
++
++	if (!id)
++		return;
++
++	/* Mark the adapter as suspended to prevent further I2C transfers */
++	i2c_mark_adapter_suspended(&id->adap);
++
++	/* Reset the controller state if active - clocks are off when suspended */
++	if (!pm_runtime_status_suspended(&pdev->dev))
++		cdns_i2c_master_reset(&id->adap);
++}
++
+ static struct platform_driver cdns_i2c_drv = {
+ 	.driver = {
+ 		.name  = DRIVER_NAME,
+@@ -1632,6 +1654,7 @@ static struct platform_driver cdns_i2c_drv = {
+ 	},
+ 	.probe  = cdns_i2c_probe,
+ 	.remove_new = cdns_i2c_remove,
++	.shutdown = cdns_i2c_shutdown,
+ };
+ 
+ module_platform_driver(cdns_i2c_drv);

@@ -2,8 +2,10 @@
 
 Android 16 for the **Radxa Orion O6**, built in Docker from CIX's public Android 16 sources
 ([cixtech/android-manifest](https://github.com/cixtech/android-manifest), branch `cix_android16_2025q3_dev`,
-"Android16 + k6.6 + 2025Q3 Rc4.2") plus six patches that make Wi-Fi, Bluetooth and `adb reboot bootloader` work,
-fix the board's freezes, and add a mouse-click-as-touch option.
+"Android16 + k6.6 + 2025Q3 Rc4.2") plus fourteen patches: six that make Wi-Fi, Bluetooth and `adb reboot bootloader`
+work, fix the board's freezes and add a mouse-click-as-touch option, six kernel fixes backported from mainline
+Linux, where CIX is upstreaming the P1 (Sky1) drivers (see [Mainline backports](#mainline-backports)), and two fixes for DP
+audio turning robotic and then silent.
 
 **Tested on a Radxa Orion O6 with the `Android-1.3.2-dmod` BIOS from
 [Radxa-Orion-O6-custom-BIOS](https://github.com/MijinTao/Radxa-Orion-O6-custom-BIOS). The Orion O6N is not supported (see [Orion O6N](#orion-o6n)).**
@@ -48,6 +50,7 @@ The images end up in **`output/O6-Android16-userdebug/`**. Without a board switc
 | `-Jobs <n>` / `--jobs <n>` | Parallel build jobs (default: all CPUs, or the `-Cpus` value; lower it if the build runs out of memory) |
 | `-Cpus <n>` / `--cpus <n>` | Limit the build container to *n* CPUs (Docker `--cpus`); also sets the jobs to *n* |
 | `-Memory <GB>` / `--memory <GB>` | Limit the build container's RAM to that many GB (Docker `--memory`, no extra swap) |
+| `-VerboseConsole` / `--verbose-console` | Leave out patch 0014: the kernel writes all its messages to the serial console again (to chase a hard freeze over UART; DP audio may break up again) |
 | `-WifiCountry <XX>` / `--wifi-country <XX>` | Wi-Fi country code (patch 0001 sets `IT`) |
 | `-OutputDir <dir>` / `--output <dir>` | Another output folder (default `output` in the repository) |
 
@@ -83,7 +86,7 @@ config lines the patches set, and `build.log`. You don't need it to flash.
 Use the BIOS from [Radxa-Orion-O6-custom-BIOS](https://github.com/MijinTao/Radxa-Orion-O6-custom-BIOS) (`Android-1.3.2-dmod`): it has the UEFI Shell `fastboot` command
 and turns the firmware's DDR low-power mode off.
 
-From the output folder, with the board connected over its **USB-C data port**:
+From the output folder (or from the repository folder: there the scripts use the newest build in `output/`, `-ImagesDir` / `--images` picks another), with the board connected over its **USB-C data port**:
 
 ```powershell
 .\flash.ps1          # update: keeps your apps and data
@@ -95,9 +98,12 @@ From the output folder, with the board connected over its **USB-C data port**:
 ./flash.sh --wipe    # full install
 ```
 
-- **Getting into fastboot**: if Android (with patch 0002) is running, the script does `adb reboot bootloader`.
-  Otherwise start fastboot yourself: power on, press **Escape**, **Boot Manager → UEFI Shell**, type `fastboot`.
-  The script waits for the board.
+- **Getting into fastboot**: if Android is running with USB debugging allowed for the PC, the script does
+  `adb reboot bootloader` (the firmware's fastboot, patch 0002); if the board comes back in Android instead, it
+  tries `adb reboot fastboot` (Android's own fastbootd), which is enough for an update. `-Wipe` needs the
+  firmware's fastboot (fastbootd can't write the partition table), so from fastbootd the script switches over with
+  `fastboot reboot bootloader`. Otherwise start fastboot yourself: power on, press **Escape**, **Boot Manager →
+  UEFI Shell**, type `fastboot`. The script keeps checking for adb and fastboot while it waits.
 - **Update** flashes both A/B slots (`dtbo`, `s2`, `boot`, `init_boot`, `vbmeta`, `vendor_boot`) and `super`, then
   reboots. **`-Wipe`** does what CIX's `android_flush_images` script does: writes the GPT that matches the
   disk's sector size, erases `userdata`, `misc`, `persist`, `metadata`, flashes everything and ends with
@@ -123,9 +129,46 @@ every build, so rebuilding always starts clean.
 | 0004 | `bluetooth-btusb-aosp-hal` | `device/cix` | **Bluetooth works.** CIX's image uses Realtek's out-of-tree `rtk_btusb`, which only serves Realtek's own HAL (not in the tree), and its firmware was missing. Switches the kernel to upstream `btusb` + `btrtl` (they know the RTL8852BE, USB `13d3:3570`), loads `btintel`/`btrtl`/`btusb` instead of `rtk_btusb`/`rfkill-bt`, installs AOSP's default Bluetooth HAL and `rtl_bt/rtl8852bu_fw.bin` from linux-firmware (binary, in the patch). |
 | 0005 | `mouse-click-as-touch` | `frameworks/native`, `frameworks/base`, `packages/apps/Settings` | **New developer option "Mouse click as touch"** (Settings → System → Developer options → Input, off by default). Left-button clicks and drags reach apps as finger taps and swipes, for apps and games that ignore mouse input; the cursor, right/middle click, wheel and hover stay mouse. Done in `PointerChoreographer` after the cursor update; the switch is plumbed like "Show taps" (`Settings.Global dmod_mouse_click_as_touch`, also `adb shell settings put global dmod_mouse_click_as_touch 1`). |
 | 0006 | `pcie-aspm-off` | `device/cix` | **Fixes the remaining random hard freezes.** The kernel's ASPM policy was `powersave`, which put the NVMe, Wi-Fi and 2.5 GbE PCIe links in L1; a CPU access to a link that didn't come back hung the whole board. The kernel default policy is now `performance` (`CONFIG_PCIEASPM_PERFORMANCE=y`): ASPM off on every link, as in Radxa's Android 1.0.0 BIOS. Costs a little idle power, no performance. The dmod BIOS (patch 0006 there) sets the firmware side to match. |
+| 0007 | `mailbox-cix-upstream-fixes` | kernel | **Mailbox hardening** (mainline `cix-mailbox.c`). The mailbox carries the SCMI traffic to the power-management firmware, the audio DSP and the sensor hub. The FIFO receive interrupt could overrun a 32-word stack buffer; a failed channel startup returned success or leaked its IRQ; kernel addresses were printed to dmesg. |
+| 0008 | `reset-sky1-reset-pulse-timing` | kernel | **Reliable block resets** (mainline `reset-sky1.c`, `reset-sky1-audss.c`). Assert/deassert returned immediately, so drivers doing assert→deassert (I2C, SPI, I3C, DMA, audio) produced a reset pulse two register writes long. Like mainline, the line is now held 50–100 µs after each edge. |
+| 0009 | `i2c-cadence-shutdown-handler` | kernel | **Clean I2C state across reboots** (mainline f612925f989). On reboot each I2C controller is marked suspended and reset, so a transfer in flight can't leave the bus busy for the firmware or the next boot. |
+| 0010 | `spi-cadence-upstream-fixes` | kernel | **SPI data integrity** (mainline 633cd6fe6e1, d9eadfce2fa, 666fa7e9ca9, 5b1689a41f0, ecea4f0e9db). RX is drained before TX is refilled (received bytes were lost on transfers longer than the FIFO); the TX-full back-off is applied per FIFO entry (transfers could stall and time out); unbind and probe failure no longer touch an unclocked controller or unbalance its clocks. |
+| 0011 | `usb-cdnsp-upstream-fixes` | kernel | **USB-C role switching** (mainline 87c5ff5615d, 87e4b043b98, 3348f444a4c). Fixes a use-after-free each time the USB-C port leaves device (ADB) mode, a NULL dereference on resume when the role changed during suspend, and a DMA memory leak on a failed USB3 streams endpoint setup. |
+| 0012 | `scmi-perf-check-allowed-ops` | kernel | **No needless DVFS requests to the SCP** (mainline 189df98777a, by CIX). Level/limit changes that the firmware reports as not allowed for a performance domain are refused locally instead of being sent to the SCP and rejected. |
+| 0013 | `dma350-cyclic-lost-period-resync` | kernel | **DP audio turning robotic, then silent** (O6 fix, not from mainline). The audio DMA tracked the playback position only by counting period interrupts; when one was held off for more than a period (5.3 ms) the position fell behind for good, until the DMA played stale data. The count is now resynchronised from the channel's address register on every interrupt; misses are counted in `/sys/module/arm_dma350/parameters/lost_periods`. |
+| 0014 | `serial-console-quiet` | `device/cix` | **Quiet serial console** (kernel command line `loglevel=4`). Every kernel message used to go out over the 115200-baud UART, and each line kept interrupts off on one CPU for ~10 ms; that made the audio DMA miss period interrupts. Now only errors and worse go to the UART; `dmesg`, `logcat` and the pstore log still have everything, and an oops/panic still prints in full. `-VerboseConsole` / `--verbose-console` builds without this patch. |
 
-All patches together change 18 files; the build checks that each one is in the result (kernel config, drivers,
+All patches together change 28 files; the build checks that each one is in the result (kernel config, drivers,
 firmware, the input library) and stops if one is missing.
+
+## Mainline backports
+
+CIX is upstreaming the P1 (Sky1) SoC support into mainline Linux and tracks it at
+[cixtech/linux-mainline/wiki](https://github.com/cixtech/linux-mainline/wiki). The mainline drivers are new, cleaned-up
+versions of the drivers in CIX's 6.6 Android kernel, often with different device-tree bindings, so they are not
+dropped in as a whole: each one was compared with the vendor driver of the pinned kernel
+(`cix_opensource__linux` 2cee169e, 6.6.100), and the bug fixes the vendor driver lacks were ported to it as
+patches 0007–0012. Each patch file starts with a description and the upstream commit IDs.
+
+| Wiki item (mainline) | Result for this kernel |
+|---|---|
+| Basic DT, board DT (v6.17) | Not applied: different bindings from the vendor DT. The only mainline DT fix (pcie_x2 RCSU address typo) doesn't exist in the vendor DT; CPU idle states are identical. |
+| Mailbox (v6.17) | **0007** |
+| UART (PL011), Clock (SCMI) (v6.17) | Nothing to port: PL011 fixes since 6.6 concern DMA/RS485/PREEMPT_RT, unused here. |
+| I2C (v6.18) | **0009**. Atomic (polled) transfers not ported: needs the clock handling reworked, no user on the O6. |
+| I3C (v6.18) | Nothing to port: the use-after-free fix and prescaler fix are already in the vendor tree; no I3C devices on the O6. |
+| SPI (v6.19) | **0010** |
+| Pinctrl (v6.19) | Not applicable: mainline driver is a rewrite with a different DT binding. |
+| PCIe (v6.19) | Nothing to port: the vendor driver already has the post-link-training delay and more (it also has a per-port `max-aspm-support` DT property). |
+| HDA (v6.19) | Nothing to port: the vendor driver already has the same quirks (polled RIRB, address offset, aligned MMIO). |
+| Reset (v7.1) | **0008**; reset tables compared, identical. |
+| GPIO (v7.1) | Nothing to port: the only functional mainline change (both-edge interrupts) is already in the vendor driver. |
+| Power domain (v7.1) | Not applicable: SCMI power domains are not used by the Android kernel (`CONFIG_ARM_SCMI_POWER_DOMAIN` off). |
+| DPU (v7.1) | Not applicable: mainline only adds the Linlon-D6 ID to `komeda`; Android uses CIX's `linlon-dp` driver. |
+| CPU idle, CPU DVFS (v7.2) | DT only in mainline (idle states identical); **0012** from CIX's SCMI perf work. |
+| DMA (v7.3) | Not applicable: mainline uses Arm's `arm-dma350` driver (no audio/cyclic support); the vendor kernel has CIX's own DMA-350 driver, fixed separately in **0013**. |
+| USB (reviewing) | **0011** (Cadence USBSSP core fixes); 11 other mainline cdnsp/xhci fixes are already in the vendor tree. |
+| USB3/DP PHY, I2S, DP, GPU (planning) | Nothing merged yet. |
 
 ## Orion O6N
 

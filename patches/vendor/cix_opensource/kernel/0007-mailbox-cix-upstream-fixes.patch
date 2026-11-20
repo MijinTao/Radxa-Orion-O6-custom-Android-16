@@ -1,0 +1,110 @@
+Backport from mainline Linux (CIX upstreaming, "MAILBOX" row of
+https://github.com/cixtech/linux-mainline/wiki): fixes in drivers/mailbox/cix-mailbox.c
+found during upstream review (fe2aa2361dd "mailbox: add CIX mailbox driver", v6.17).
+
+The CIX mailbox carries the SCMI traffic between Linux and the power-management
+firmware (SCP: DVFS, clocks, sensors), the audio DSP and the sensor hub.
+
+- FIFO RX: the interrupt handler drained the hardware FIFO into a 32-word stack
+  buffer with no bound, so a misbehaving remote (or a FIFO holding more than one
+  message) overwrote the kernel stack. Now stops at 32 words and zero-fills the buffer.
+- startup(): on an invalid fast-channel index it returned 0 (success) with the IRQ
+  still requested; on an invalid channel type it returned with the IRQ leaked.
+  Both now free the IRQ and return -EINVAL.
+- No more kernel virtual addresses (%px) printed to dmesg at every channel startup;
+  register failures are reported with dev_err_probe().
+
+The vendor DT binding (cix,mbox_dir = <0|1>) and ACPI matching are unchanged.
+
+diff --git a/drivers/mailbox/cix-mailbox.c b/drivers/mailbox/cix-mailbox.c
+index 5dc711d40..f0f777222 100644
+--- a/drivers/mailbox/cix-mailbox.c
++++ b/drivers/mailbox/cix-mailbox.c
+@@ -287,7 +287,7 @@ static void cix_mbox_isr_reg(struct mbox_chan *chan)
+ static void cix_mbox_isr_fifo(struct mbox_chan *chan)
+ {
+ 	struct cix_mbox_priv *priv = to_cix_mbox_priv(chan->mbox);
+-	u32 data[CIX_MBOX_MSG_LEN];
++	u32 data[CIX_MBOX_MSG_LEN] = { 0 };
+ 	int i = 0;
+ 	u32 int_status, status, val_32;
+ 
+@@ -297,9 +297,14 @@ static void cix_mbox_isr_fifo(struct mbox_chan *chan)
+ 		/* FIFO waterMark interrupt is generated */
+ 		if (int_status & (FIFO_FULL_INT | FIFO_WM01_INT)) {
+ 			cix_mbox_write(priv, (FIFO_FULL_INT | FIFO_WM01_INT), INT_CLEAR);
++			/*
++			 * Never read more than one message (32 words) into the
++			 * on-stack buffer, even if the FIFO holds more data
++			 * (as the mainline driver does).
++			 */
+ 			do {
+ 				data[i++] = cix_mbox_read(priv, FIFO_RD);
+-			} while (false == mbox_fifo_empty(chan));
++			} while (!mbox_fifo_empty(chan) && i < CIX_MBOX_MSG_LEN);
+ 			mbox_chan_received_data(chan, data);
+ 		}
+ 		/* FIFO underflow is generated */
+@@ -399,14 +404,8 @@ static int cix_mbox_startup(struct mbox_chan *chan)
+ 			priv->irq);
+ 		return ret;
+ 	}
+-	dev_info(priv->dev,
+-		 "%s, base %px, irq %d, dir %d, type %d, index %d\n",
+-		 __func__,
+-		 priv->base,
+-		 priv->irq,
+-		 priv->dir,
+-		 cp->type,
+-		 cp->index);
++	dev_dbg(priv->dev, "%s: irq %d, dir %d, type %d, index %d\n",
++		__func__, priv->irq, priv->dir, cp->type, cp->index);
+ 
+ 	switch (cp->type) {
+ 	case CIX_MBOX_TYPE_DB:
+@@ -449,7 +448,8 @@ static int cix_mbox_startup(struct mbox_chan *chan)
+ 			if (index < 0 || index > MBOX_FAST_IDX) {
+ 				dev_err(priv->dev,
+ 					"Invalid index %d\n", index);
+-				return ret;
++				ret = -EINVAL;
++				goto failed;
+ 			}
+ 			/* enable fast channel interrupt */
+ 			val_32 = cix_mbox_read(priv, INT_ENABLE_SIDE_B);
+@@ -459,9 +459,14 @@ static int cix_mbox_startup(struct mbox_chan *chan)
+ 		break;
+ 	default:
+ 		dev_err(priv->dev, "Invalid channel type: %d\n", cp->type);
+-		return -EINVAL;
++		ret = -EINVAL;
++		goto failed;
+ 	}
+ 	return 0;
++
++failed:
++	free_irq(priv->irq, chan);
++	return ret;
+ }
+ 
+ static void cix_mbox_shutdown(struct mbox_chan *chan)
+@@ -588,17 +593,12 @@ static int cix_mbox_probe(struct platform_device *pdev)
+ 	priv->mbox.chans = priv->mbox_chans;
+ 	priv->mbox.txdone_irq = true;
+ 	priv->mbox.num_chans = CIX_MBOX_CHANS;
+-	dev_info(priv->dev,
+-		 "%s, base %px, irq %d, dir %d\n",
+-		 __func__,
+-		 priv->base,
+-		 priv->irq,
+-		 priv->dir);
++	dev_dbg(priv->dev, "%s: irq %d, dir %d\n", __func__, priv->irq, priv->dir);
+ 
+ 	platform_set_drvdata(pdev, priv);
+ 	ret = devm_mbox_controller_register(dev, &priv->mbox);
+ 	if (ret)
+-		return ret;
++		return dev_err_probe(dev, ret, "Failed to register mailbox\n");
+ 
+ 	return 0;
+ }

@@ -1,0 +1,31 @@
+Orion O6: quiet serial console (kernel command line loglevel=4).
+
+Only kernel messages of level 0-3 (emergency, alert, critical, error) are written to the
+115200-baud serial console (console=ttyAMA2). Before, every info message went out over it;
+each line keeps interrupts off on the printing CPU for ~10 ms, which made the audio DMA miss
+period interrupts (DP audio turned robotic, then silent - see also patch 0013). Lowering
+the console log level at runtime made the problem go away on the board.
+
+dmesg, logcat and the pstore log keep everything; an oops or panic still prints in full on
+the serial port (the kernel raises the console level for those). Build with
+-VerboseConsole (build.ps1) / --verbose-console (build.sh) to leave this patch out and get
+the full serial log back, e.g. to chase a hard freeze.
+
+diff --git a/sky1/sky1_orion_o6/BoardConfig.mk b/sky1/sky1_orion_o6/BoardConfig.mk
+index 6a9773b..5adc49a 100644
+--- a/sky1/sky1_orion_o6/BoardConfig.mk
++++ b/sky1/sky1_orion_o6/BoardConfig.mk
+@@ -98,6 +98,13 @@ BOARD_KERNEL_BASE := 0x86000000
+ 
+ BOARD_KERNEL_CMDLINE := init=/init earlycon=pl011,0x40d0000 console=ttyAMA2,115200 firmware_class.path=/vendor/firmware loop.max_part=7 arm64.nosve kasan=off arm64.nomte
+ 
++# Orion O6 (patch 0014): only errors and worse (log levels 0-3) go to the 115200-baud serial console.
++# Writing each kernel message to it keeps interrupts off on one CPU for ~10 ms per line, long enough for
++# the audio DMA to miss a period interrupt (DP audio turning robotic, then silent). Everything is still
++# in dmesg/logcat, and an oops or panic still prints in full (the kernel raises the level for those).
++# Build with -VerboseConsole / --verbose-console to leave this patch out.
++BOARD_KERNEL_CMDLINE += loglevel=4
++
+ ifeq (MINI, $(filter MINI,$(TARGET_ROOTFS)))
+ BOARD_KERNEL_CMDLINE += force_recovery
+ endif

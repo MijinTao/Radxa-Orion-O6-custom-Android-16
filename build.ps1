@@ -10,6 +10,7 @@
   .\build.ps1 -O6 -Latest -Sync      # newest CIX manifest instead of the pinned one (patches may not apply)
   .\build.ps1 -O6 -WifiCountry DE    # another Wi-Fi country code (the patches set IT)
   .\build.ps1 -O6 -Cpus 16 -Memory 48 # limit the build container to 16 CPUs and 48 GB of RAM
+  .\build.ps1 -O6 -VerboseConsole    # leave out patch 0014: full kernel log on the serial console
 
   Without -O6 / -O6N it builds the O6. -O6N stops with an explanation: CIX's tree has no O6N device.
   The first run downloads about 90 GB of source into the Docker volume and takes several hours.
@@ -25,6 +26,7 @@ param(
   [double]$Cpus = 0,
   [int]$Memory = 0,
   [string]$WifiCountry = '',
+  [switch]$VerboseConsole,
   [string]$OutputDir = (Join-Path $PSScriptRoot 'output'),
   [string]$Image = 'radxa-o6-android16-builder',
   [string]$SourceVolume = 'radxa-o6-android16-src'
@@ -60,6 +62,7 @@ foreach ($board in $boards) {
   if ($Memory -gt 0) { $limitArgs += @('--memory', "${Memory}g", '--memory-swap', "${Memory}g") }
   if ($limitArgs.Count -gt 0) { Write-Host "Limits: $($limitArgs -join ' ')  jobs: $(if ($buildJobs) { $buildJobs } else { 'all CPUs' })" -ForegroundColor Yellow }
   if ($WifiCountry) { $envArgs += @('-e', "WIFI_COUNTRY=$WifiCountry") }
+  if ($VerboseConsole) { $envArgs += @('-e', 'SKIP_PATCHES=0014'); Write-Host 'Leaving out patch 0014 (quiet serial console)' -ForegroundColor Yellow }
   docker run --rm -t @limitArgs `
     -v "${SourceVolume}:/work" `
     -v "${OutputDir}:/out" `

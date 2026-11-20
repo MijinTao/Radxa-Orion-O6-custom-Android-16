@@ -3,7 +3,8 @@
   Flashes an Orion O6 Android 16 build (the output of build.ps1 / build.sh) over USB with fastboot.
 
 .DESCRIPTION
-  Run it from the build's output folder (it is copied there), or pass -ImagesDir.
+  Run it from the build's output folder (it is copied there), or pass -ImagesDir. Run from the repository
+  folder (no images next to it), it uses the newest build in output\ that has a boot.img.
   1. Checks the images against SHA256SUMS.
   2. Gets the board into fastboot: "adb reboot bootloader" if Android is running, otherwise it waits
      while you start fastboot yourself (UEFI Shell command "fastboot" on the dmod BIOS).
@@ -36,6 +37,13 @@ function Find-Tool([string]$name) {
 }
 $adb = Find-Tool 'adb'
 $fastboot = Find-Tool 'fastboot'
+if (-not $PSBoundParameters.ContainsKey('ImagesDir') -and -not (Test-Path (Join-Path $ImagesDir 'boot.img'))) {
+  # Started from the repository folder: use the newest build in output\
+  $newest = Get-ChildItem -Directory -Path (Join-Path $PSScriptRoot 'output') -ErrorAction SilentlyContinue |
+    Where-Object { Test-Path (Join-Path $_.FullName 'boot.img') } |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+  if ($newest) { $ImagesDir = $newest.FullName }
+}
 $ImagesDir = (Resolve-Path $ImagesDir).Path
 $log = Join-Path $ImagesDir ("flash-" + (Get-Date -Format 'yyyyMMdd-HHmmss') + ".log")
 
@@ -49,7 +57,48 @@ function Run([string]$exe, [string]$a, [switch]$Quiet) {
   [pscustomobject]@{ Code = $code; Out = $text }
 }
 function Fastboot-Serial { $r = Run $fastboot 'devices' -Quiet; if ($r.Out -match '(\S+)\s+fastboot') { $Matches[1] } else { $null } }
-function Adb-Up { (Run $adb 'get-state' -Quiet).Out -eq 'device' }
+# adb state of the board: device / unauthorized / recovery / sideload / offline, or $null if adb doesn't see it.
+# The server is started first, so its "daemon not running; starting now" messages can't hide the answer.
+function Adb-State {
+  Run $adb 'start-server' -Quiet | Out-Null
+  foreach ($l in ((Run $adb 'devices' -Quiet).Out -split "`r?`n")) {
+    if ($l -match '^(\S+)\s+(device|unauthorized|recovery|sideload|offline|bootloader)\s*$') { return $Matches[2] }
+  }
+  return $null
+}
+function Adb-Up { (Adb-State) -eq 'device' }
+# Waits for a fastboot device; while waiting, reboots a running Android into fastboot:
+# first "adb reboot bootloader" (firmware fastboot, patch 0002), and if the board comes back in Android
+# instead, "adb reboot fastboot" (Android's own fastbootd).
+function Wait-Fastboot {
+  $deadline = (Get-Date).AddSeconds($FastbootTimeoutSec); $start = Get-Date
+  $sent = $null; $gone = $false; $said = @{}
+  while (-not ($s = Fastboot-Serial)) {
+    if ((Get-Date) -gt $deadline) { Fail "no fastboot device within $FastbootTimeoutSec s" }
+    $st = Adb-State
+    if ($st -eq 'device') {
+      if (-not $sent) {
+        Log 'Android is running: adb reboot bootloader'; Run $adb 'reboot bootloader' -Quiet | Out-Null; $sent = 'bootloader'
+      } elseif ($gone -and $sent -eq 'bootloader') {
+        Log 'The board came back in Android, not fastboot: adb reboot fastboot'; Run $adb 'reboot fastboot' -Quiet | Out-Null
+        $sent = 'fastboot'; $gone = $false
+      } elseif ($gone -and -not $said.manual) {
+        Log 'Still not in fastboot. Start it from the UEFI Shell (Escape, Boot Manager, UEFI Shell, "fastboot"); still waiting.'
+        $said.manual = $true
+      }
+    } elseif ($st -eq 'unauthorized' -and -not $said.auth) {
+      Log 'adb sees the board but USB debugging is not allowed for this PC: accept the prompt on the board''s screen ("Always allow").'
+      $said.auth = $true
+    }
+    if ($sent -and $st -ne 'device') { $gone = $true }
+    if (-not $sent -and -not $said.wait -and ((Get-Date) - $start).TotalSeconds -ge 6) {
+      Log 'Waiting for the board: boot Android with USB debugging on, or start fastboot from the UEFI Shell ("fastboot"); USB-C data port ...'
+      $said.wait = $true
+    }
+    Start-Sleep -Seconds 2
+  }
+  return $s
+}
 function Adb-Sh([string]$c) { (Run $adb "shell $c" -Quiet).Out }
 
 Log "flash: images=$ImagesDir wipe=$Wipe"
@@ -75,23 +124,27 @@ if ($Wipe -and -not $Yes) {
 }
 
 # 2. Into fastboot
-$serial = Fastboot-Serial
-if (-not $serial) {
-  if (Adb-Up) { Log 'Android is running: adb reboot bootloader'; Run $adb 'reboot bootloader' | Out-Null }
-  else { Log 'Waiting for the board in fastboot mode: in the UEFI Shell type "fastboot" and connect the USB-C data port ...' }
-  $deadline = (Get-Date).AddSeconds($FastbootTimeoutSec); $gone = $false; $hinted = $false
-  while (-not ($serial = Fastboot-Serial)) {
-    if ((Get-Date) -gt $deadline) { Fail "no fastboot device within $FastbootTimeoutSec s" }
-    $up = Adb-Up; if (-not $up) { $gone = $true }
-    if ($gone -and $up -and -not $hinted) {
-      Log 'The board came back in Android, not fastboot (the running image lacks the reboot-to-fastboot patch). Start fastboot from the UEFI Shell; still waiting.'
-      $hinted = $true
-    }
-    Start-Sleep -Seconds 2
-  }
-}
+$serial = Wait-Fastboot
 Log "Fastboot device: $serial"
 $vars = Run $fastboot 'getvar all' -Quiet
+if ($vars.Out -match 'is-userspace:\s*yes') {
+  if ($Wipe) {
+    # Android's fastbootd can't write the partition table: go to the firmware's fastboot
+    Log 'In Android''s fastbootd; a full install needs the firmware fastboot: fastboot reboot bootloader'
+    Run $fastboot 'reboot bootloader' -Quiet | Out-Null
+    Start-Sleep -Seconds 5
+    $deadline = (Get-Date).AddSeconds($FastbootTimeoutSec)
+    do {
+      if ((Get-Date) -gt $deadline) { Fail 'the board did not come back in the firmware fastboot; start it from the UEFI Shell and run again' }
+      Start-Sleep -Seconds 2
+      $serial = Fastboot-Serial
+      $vars = if ($serial) { Run $fastboot 'getvar all' -Quiet } else { $null }
+    } while (-not $vars -or $vars.Out -match 'is-userspace:\s*yes')
+    Log "Fastboot device: $serial (firmware fastboot)"
+  } else {
+    Log '  (Android''s fastbootd)'
+  }
+}
 if ($vars.Out -match 'backdoor:yes') { Fail 'the board is in DDR ("backdoor") fastboot mode; this script flashes the NVMe install only' }
 
 # 3. Flash

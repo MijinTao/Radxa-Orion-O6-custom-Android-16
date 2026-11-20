@@ -1,0 +1,86 @@
+Backport from mainline Linux ("USB" row of the CIX upstream wiki: the Sky1
+USB-C/USB3 ports are Cadence USBSSP "cdnsp" dual-role controllers; CIX's
+platform glue is being upstreamed as e4d7362dc9c "usb: cdns3: Add USBSSP
+platform driver support"). Fixes from mainline drivers/usb/cdns3 that the
+6.6 vendor tree does not have yet:
+
+- 87c5ff5615d "usb: cdns3: gadget: Use-after-free during failed initialization
+  and exit of cdnsp gadget": cdnsp_gadget_exit() freed the gadget before its
+  endpoints, which are still linked into the gadget's ep_list. This runs on
+  every device->host role switch of the USB-C port (unplugging from the PC /
+  plugging in a USB stick or hub) and on gadget init failure.
+- 87e4b043b98 "usb: cdns3: fix role switching during resume": if the role
+  changed while the system was suspended, resume called the new role's
+  resume() on an xHCI device whose probe is still deferred -> NULL pointer
+  dereference (kernel oops) on resume.
+- 3348f444a4c "usb: cdnsp: fix stream context array leak in
+  cdnsp_alloc_stream_info()": DMA memory leak on a failed USB3 bulk-streams
+  (UASP) endpoint setup in device mode.
+
+Checked and already present in the vendor tree: 7e2c421ef88 (CIX), f4ecdc35264,
+2852788cfbe, 8614ecdb157, 241e2ce88e5, 1702bec4477, 740f2e2791b, 0497a356d3c,
+a1059896f2b, 58f2fcb3a84, e5fa8db0be3 (XHCI_CDNS_SCTX_QUIRK).
+
+diff --git a/drivers/usb/cdns3/cdnsp-gadget.c b/drivers/usb/cdns3/cdnsp-gadget.c
+index 33b13eab3..f05e9e38d 100644
+--- a/drivers/usb/cdns3/cdnsp-gadget.c
++++ b/drivers/usb/cdns3/cdnsp-gadget.c
+@@ -1977,7 +1977,14 @@ static int __cdnsp_gadget_init(struct cdns *cdns)
+ 	return 0;
+ 
+ del_gadget:
+-	usb_del_gadget_udc(&pdev->gadget);
++	/*
++	 * Free the endpoints (linked into pdev->gadget.ep_list) before the
++	 * final put of the gadget (mainline 87c5ff5615d).
++	 */
++	usb_del_gadget(&pdev->gadget);
++	cdnsp_gadget_free_endpoints(pdev);
++	usb_put_gadget(&pdev->gadget);
++	goto halt_pdev;
+ free_endpoints:
+ 	cdnsp_gadget_free_endpoints(pdev);
+ halt_pdev:
+@@ -1998,9 +2005,10 @@ static void cdnsp_gadget_exit(struct cdns *cdns)
+ 
+ 	pm_runtime_mark_last_busy(cdns->dev);
+ 	pm_runtime_put_autosuspend(cdns->dev);
+-	usb_del_gadget_udc(&pdev->gadget);
++	usb_del_gadget(&pdev->gadget);
+ 	devm_free_irq(pdev->dev, cdns->dev_irq, pdev);
+ 	cdnsp_gadget_free_endpoints(pdev);
++	usb_put_gadget(&pdev->gadget);
+ 	cdnsp_mem_cleanup(pdev);
+ 	kfree(pdev);
+ 	cdns->gadget_dev = NULL;
+diff --git a/drivers/usb/cdns3/cdnsp-mem.c b/drivers/usb/cdns3/cdnsp-mem.c
+index 90e011eed..6c54223e9 100644
+--- a/drivers/usb/cdns3/cdnsp-mem.c
++++ b/drivers/usb/cdns3/cdnsp-mem.c
+@@ -632,6 +632,8 @@ int cdnsp_alloc_stream_info(struct cdnsp_device *pdev,
+ 		}
+ 	}
+ 
++	cdnsp_free_stream_ctx(pdev, pep);
++
+ cleanup_stream_rings:
+ 	kfree(pep->stream_info.stream_rings);
+ 
+diff --git a/drivers/usb/cdns3/core.c b/drivers/usb/cdns3/core.c
+index 2cd9bd885..b0db62fb2 100644
+--- a/drivers/usb/cdns3/core.c
++++ b/drivers/usb/cdns3/core.c
+@@ -644,7 +644,12 @@ int cdns_resume(struct cdns *cdns)
+ 		}
+ 	}
+ 
+-	if (cdns->roles[cdns->role]->resume)
++	/*
++	 * If the role changed while suspended, start() of the new role already
++	 * ran; its resume() would touch a host controller whose probe is still
++	 * deferred and crash (mainline 87e4b043b98).
++	 */
++	if (!role_changed && cdns->roles[cdns->role]->resume)
+ 		cdns->roles[cdns->role]->resume(cdns, cdns_power_is_lost(cdns));
+ 
+ 	return 0;
