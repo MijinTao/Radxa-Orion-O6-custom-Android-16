@@ -16,6 +16,8 @@
 #   JOBS            parallel build jobs                                                  (default: all CPUs)
 #   SYNC_JOBS       parallel download jobs                                               (default: 8)
 #   WIFI_COUNTRY    two-letter Wi-Fi country code (patch 0001 sets IT)                  (default: from the patch)
+#   SKIP_PATCHES    patch numbers to leave out, e.g. "0014" (build.ps1 -VerboseConsole /
+#                   build.sh --verbose-console set 0014)                                (default: none)
 #   HOST_UID/HOST_GID  build as this user id and own the output (Linux hosts)
 #
 # Volumes:
@@ -36,6 +38,7 @@ SYNC="${SYNC:-0}"
 JOBS="${JOBS:-$(nproc)}"
 SYNC_JOBS="${SYNC_JOBS:-8}"
 WIFI_COUNTRY="${WIFI_COUNTRY:-}"
+SKIP_PATCHES="$(echo "${SKIP_PATCHES:-}" | tr ',' ' ')"
 PATCH_DIR=/opt/android-patches
 PINNED=/opt/android-manifest/orion-o6-pinned.xml
 SRC=/work/cix-android16
@@ -65,6 +68,8 @@ esac
 case "$VARIANT" in userdebug|user) ;; *) die "VARIANT must be userdebug or user (got '$VARIANT')" ;; esac
 case "$PATCHES" in 0|1) ;; *) die "PATCHES must be 1 or 0 (got '$PATCHES')" ;; esac
 case "$MANIFEST" in pinned|latest) ;; *) die "MANIFEST must be pinned or latest (got '$MANIFEST')" ;; esac
+for n in $SKIP_PATCHES; do [[ "$n" =~ ^[0-9]{4}$ ]] || die "SKIP_PATCHES: '$n' is not a 4-digit patch number"; done
+skipped() { local n; for n in $SKIP_PATCHES; do [[ "$1" == "$n"-* ]] && return 0; done; return 1; }
 if [[ "$PATCHES" == "1" && -z "$(find "$PATCH_DIR" -name '*.patch' 2>/dev/null | head -1)" ]]; then
   die "PATCHES=1 but no patches found in $PATCH_DIR"
 fi
@@ -116,6 +121,7 @@ if [[ "$PATCHES" == "1" ]]; then
   # Apply in patch-number order (one number = one fix, possibly in several projects)
   while read -r name rel; do
     proj="$(dirname "$rel")"
+    if skipped "$name"; then echo "skipping $rel  (SKIP_PATCHES)"; continue; fi
     echo "applying $rel  (sha256 $(sha256sum "$PATCH_DIR/$rel" | cut -c1-16))"
     git -C "$SRC/$proj" apply --whitespace=nowarn "$PATCH_DIR/$rel" \
       || die "patch $rel does not apply (tree changed? try MANIFEST=pinned)"
@@ -152,7 +158,10 @@ for f in "${IMAGES[@]}"; do
 done
 KCONF="$OUTDIR/obj/KERNEL_OBJ/.config"
 if [[ "$PATCHES" == "1" ]]; then
-  check() { if eval "$2"; then printf '  %-34s yes\n' "$1"; else printf '  %-34s NO\n' "$1"; ok=0; fi; }
+  check() {
+    if skipped "${1%% *}-"; then printf '  %-34s skipped\n' "$1"; return; fi
+    if eval "$2"; then printf '  %-34s yes\n' "$1"; else printf '  %-34s NO\n' "$1"; ok=0; fi
+  }
   ok=1
   check "0002 reboot-to-fastboot driver"  "grep -q 'cix-reboot-reason.o' vendor/cix_opensource/kernel/drivers/soc/cix/Makefile"
   check "0003 DDR LP off (kernel)"        "grep -q ORION_O6_DDRLP_OFF vendor/cix_opensource/kernel/drivers/soc/cix/cix-ddr-lp.c"
@@ -160,12 +169,25 @@ if [[ "$PATCHES" == "1" ]]; then
   check "0004 BT firmware in vendor"      "[[ -s '$OUTDIR/vendor/firmware/rtl_bt/rtl8852bu_fw.bin' ]]"
   check "0005 mouse-as-touch in input"    "grep -q 'Mouse Click As Touch' '$OUTDIR/system/lib64/libinputflinger.so'"
   check "0006 kernel ASPM performance"    "grep -q '^CONFIG_PCIEASPM_PERFORMANCE=y' '$KCONF'"
+  check "0007 mailbox FIFO bound"         "grep -q 'i < CIX_MBOX_MSG_LEN' vendor/cix_opensource/kernel/drivers/mailbox/cix-mailbox.c"
+  check "0008 reset pulse timing"         "grep -q SKY1_RESET_PULSE_MIN_US vendor/cix_opensource/kernel/drivers/reset/reset-sky1.c"
+  check "0009 i2c shutdown handler"       "grep -q cdns_i2c_shutdown vendor/cix_opensource/kernel/drivers/i2c/busses/i2c-cadence.c"
+  check "0010 spi RX-before-TX"           "grep -q 'Drain RX before refilling TX' vendor/cix_opensource/kernel/drivers/spi/spi-cadence.c"
+  check "0011 cdnsp role/UAF fixes"       "grep -q '!role_changed && cdns->roles' vendor/cix_opensource/kernel/drivers/usb/cdns3/core.c"
+  check "0012 scmi perf allowed ops"      "grep -q '!dom->info.set_perf' vendor/cix_opensource/kernel/drivers/firmware/arm_scmi/perf.c"
+  check "0013 dma350 lost-period resync"  "grep -q arm_dma350_cyclic_resync vendor/cix_opensource/kernel/drivers/dma/arm_dma350.c"
+  check "0014 quiet serial console"       "grep -q '^BOARD_KERNEL_CMDLINE += loglevel=4' device/cix/sky1/sky1_orion_o6/BoardConfig.mk"
   [[ "$ok" == "1" ]] || die "a patch feature is missing from the build"
 fi
 
 # --- 5. output ------------------------------------------------------------------------------------------
 log "5/6 Writing $PKG_NAME"
-rm -rf "$PKG" "$INFO"; mkdir -p "$PKG" "$INFO"
+# Empty the output folders instead of deleting them: on Windows a folder that is open in Explorer or is
+# the current folder of a PowerShell window (e.g. after flashing from it) can't be removed.
+mkdir -p "$PKG" "$INFO"
+find "$PKG" "$INFO" -mindepth 1 -delete 2>/dev/null || \
+  die "can't clear $PKG_NAME in the output folder: close any program that has a file in it open (an editor, a
+       running flash script) and run the build again (it is incremental, the compiled tree is kept)"
 cp "${IMAGES[@]/#/$OUTDIR/images/}" "$PKG/"
 cp "$OUTDIR/images/partition-table-32GB.img" "$OUTDIR/images/partition-table-32GB-4096.img" \
    "$OUTDIR/images/dtbo-sky1-orion_o6.img" "$OUTDIR/images/vbmeta-sky1-orion_o6.img" "$PKG/" 2>/dev/null || true
@@ -179,6 +201,8 @@ chmod +x "$PKG/flash.sh"
   grep -h -E '^ro\.build\.(fingerprint|date)=' "$OUTDIR/system/build.prop" 2>/dev/null || true
   echo "Kernel: $(strings "$OUTDIR/kernel" 2>/dev/null | grep -m1 'Linux version' || echo '?')"
   [[ -n "$WIFI_COUNTRY" ]] && echo "Wi-Fi country: $WIFI_COUNTRY"
+  [[ -n "$SKIP_PATCHES" ]] && echo "Skipped patches: $SKIP_PATCHES"
+  echo "Kernel command line: $(grep -h '^BOARD_KERNEL_CMDLINE' device/cix/sky1/sky1_orion_o6/BoardConfig.mk | sed 's/^BOARD_KERNEL_CMDLINE *[:+]= *//' | tr '\n' ' ')"
   if [[ "$PATCHES" == "1" ]]; then (cd "$PATCH_DIR" && find . -name '*.patch' -printf '%P\n' | sort | xargs sha256sum | sed 's/^/patch: /'); fi
   echo "Built $(date -u +%Y-%m-%dT%H:%M:%SZ) in $(. /etc/os-release && echo "$PRETTY_NAME"), $JOBS jobs"
 } > "$INFO/BUILD-INFO.txt"

@@ -8,6 +8,7 @@
 #   ./build.sh --o6 --latest --sync    newest CIX manifest instead of the pinned one (patches may not apply)
 #   ./build.sh --o6 --wifi-country DE  another Wi-Fi country code (the patches set IT)
 #   ./build.sh --o6 --cpus 16 --memory 48   limit the build container to 16 CPUs and 48 GB of RAM
+#   ./build.sh --o6 --verbose-console  leave out patch 0014: full kernel log on the serial console
 #
 # Without --o6 / --o6n it builds the O6. --o6n stops with an explanation: CIX's tree has no O6N device.
 # Other options: --jobs <n>, --output <dir>. The first run downloads ~90 GB and takes several hours.
@@ -22,6 +23,7 @@ JOBS=""
 CPUS=""
 MEMORY=""
 WIFI_COUNTRY=""
+SKIP_PATCHES=""
 HERE="$(cd "$(dirname "$0")" && pwd)"
 OUTPUT_DIR="$HERE/output"
 IMAGE="${IMAGE:-radxa-o6-android16-builder}"
@@ -40,7 +42,8 @@ while [[ $# -gt 0 ]]; do
     --memory)       MEMORY="$2"; shift 2 ;;
     --wifi-country) WIFI_COUNTRY="$2"; shift 2 ;;
     --output)       OUTPUT_DIR="$2"; shift 2 ;;
-    -h|--help)      sed -n '2,15p' "$0"; exit 0 ;;
+    --verbose-console) SKIP_PATCHES="0014"; shift ;;
+    -h|--help)      sed -n '2,16p' "$0"; exit 0 ;;
     *) echo "unknown option: $1 (see --help)" >&2; exit 1 ;;
   esac
 done
@@ -61,6 +64,7 @@ for BOARD in "${BOARDS[@]}"; do
   [[ -n "$MEMORY" ]] && limits+=(--memory "${MEMORY}g" --memory-swap "${MEMORY}g")
   [[ ${#limits[@]} -gt 0 ]] && echo "Limits: ${limits[*]}  jobs: ${jobs:-all CPUs}"
   [[ -n "$WIFI_COUNTRY" ]] && extra+=(-e "WIFI_COUNTRY=$WIFI_COUNTRY")
+  [[ -n "$SKIP_PATCHES" ]] && { extra+=(-e "SKIP_PATCHES=$SKIP_PATCHES"); echo "Leaving out patch(es) $SKIP_PATCHES"; }
   docker run --rm -t "${limits[@]}" \
     -v "$SOURCE_VOLUME:/work" \
     -v "$OUTPUT_DIR:/out" \

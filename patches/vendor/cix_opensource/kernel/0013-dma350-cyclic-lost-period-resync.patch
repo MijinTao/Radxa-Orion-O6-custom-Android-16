@@ -1,0 +1,191 @@
+Orion O6 fix (no mainline equivalent: mainline's arm-dma350 driver has no cyclic/audio
+support yet; the "DMA" item of the CIX upstream wiki is a different driver).
+
+Symptom: audio on a DP monitor starts fine, turns choppy/robotic after a while, then
+stops or plays garbage.
+
+The vendor DMA-350 driver works out the position of cyclic (audio) transfers only by
+counting "period done" interrupts (desnum[]). The DONE status is a single bit, so if
+the interrupt is held off for more than one period (256 frames = 5.3 ms at 48 kHz),
+two completions are seen as one and the position reported to ALSA stays one period
+behind the hardware for good. Every further miss adds another period, until the app
+writes into the part of the ring the DMA has already played: first repeated
+fragments ("robotic"), then stale data or silence. On this board long interrupt-off
+stretches come e.g. from kernel messages written to the 115200-baud serial console.
+
+Fix: on each period interrupt, read the channel's current address register (SRCADDR
+for playback, DESADDR for capture), before clearing the interrupt status, and if the
+hardware is 1..n-2 periods ahead of the count, advance the count. If the register is
+outside the ring, or still points into the period that just finished, nothing changes
+(same behaviour as before). Lost periods are counted in
+/sys/module/arm_dma350/parameters/lost_periods, with a one-time warning in dmesg.
+
+Also: two per-stream-start messages ("use dynamic channel-N", "Channel N initialized
+with N periods") are now debug level, so starting a sound doesn't print to the serial
+console.
+
+diff --git a/drivers/dma/arm_dma350.c b/drivers/dma/arm_dma350.c
+index e4bcefdd2..041f49766 100755
+--- a/drivers/dma/arm_dma350.c
++++ b/drivers/dma/arm_dma350.c
+@@ -88,6 +88,11 @@ struct arm_dma350_chan {
+ 	dma_addr_t dev_addr;
+ 	enum dma_status status;
+ 	bool is_used_runtime;
++	/* cyclic ring as the DMA sees it (address after ram-map translation) */
++	u32 cyc_start;
++	u32 cyc_len;
++	u32 cyc_period;
++	bool cyc_mem_to_dev;
+ };
+ 
+ struct arm_dma350_phy {
+@@ -140,6 +145,67 @@ static dma_addr_t phy_cmd0[MAX_CHAN_NUM];
+ 
+ static atomic_t vaild_chan_id[MAX_CHAN_NUM];
+ 
++/*
++ * The cyclic (audio) position is derived from the number of "period done"
++ * interrupts. When two periods complete before the handler runs (interrupt
++ * latency above one period, 5.3 ms for 256 frames at 48 kHz), only one
++ * interrupt is seen and the position ALSA gets stays one period behind the
++ * hardware for good; each further miss adds a period, until the application
++ * writes into the part of the ring the DMA has already played (robotic
++ * sound, then garbage/silence). Count such misses and resynchronise the
++ * period counter from the channel's current address register.
++ */
++static unsigned int lost_periods;
++module_param(lost_periods, uint, 0444);
++MODULE_PARM_DESC(lost_periods, "Cyclic period interrupts found missing and resynchronised from hardware");
++
++/* Byte offset of the channel inside its cyclic ring, or -1 if unknown */
++static long arm_dma350_cyclic_hw_offset(struct arm_dma350_chan *c,
++					struct arm_dma350_phy *p)
++{
++	u32 addr, off;
++
++	if (!p || !c->cyc_len || !c->cyc_period)
++		return -1;
++	addr = readl_relaxed(p->base + (c->cyc_mem_to_dev ? DMA350_REG_SRCADDR :
++							      DMA350_REG_DESADDR));
++	off = addr - c->cyc_start;
++	if (off > c->cyc_len)
++		return -1;
++	return off == c->cyc_len ? 0 : off;
++}
++
++/*
++ * Called after desnum[] was advanced for a period interrupt, with the ring
++ * offset read before the interrupt status was cleared (a period finishing
++ * after the clear raises a new interrupt and must not be counted here; one
++ * finishing before it would otherwise be lost). desnum[] counts
++ * completed periods 1..n, so the hardware should now be in period desnum % n.
++ * If it is already 1..n-2 periods further, those period interrupts were
++ * lost: count them and move desnum[] along. A difference of n-1 means the
++ * address register still points into the period that just completed (the
++ * next command is not loaded yet) and is ignored, as is an address outside
++ * the ring - in both cases the behaviour is the same as before.
++ */
++static void arm_dma350_cyclic_resync(struct arm_dma350_chan *c, long off, u32 ch)
++{
++	u32 n = dmachan[ch], hw_idx, sw_idx, diff;
++
++	if (n < 3 || off < 0 || !c->cyc_period)
++		return;
++	hw_idx = (u32)off / c->cyc_period;
++	sw_idx = desnum[ch] % n;
++	diff = (hw_idx + n - sw_idx) % n;
++	if (diff == 0 || diff > n - 2)
++		return;
++
++	lost_periods += diff;
++	pr_warn_once("arm-dma350: cyclic period interrupts were lost, position resynchronised from hardware (count in /sys/module/arm_dma350/parameters/lost_periods)\n");
++	desnum[ch] += diff;
++	while (desnum[ch] > n)
++		desnum[ch] -= n;
++}
++
+ static struct arm_dma350_chan *to_dma350_chan(struct dma_chan *chan)
+ {
+ 	return container_of(chan, struct arm_dma350_chan, vc.chan);
+@@ -369,6 +435,7 @@ static irqreturn_t arm_dma350_int_handler(int irq, void *dev_id)
+ 	struct arm_dma350_phy *p;
+ 	struct arm_dma350_chan *c;
+ 	u32 chstatus = 0, ch_idx = 0;
++	long hwoff;
+ 
+ 	while (ch_idx < MAX_CHAN_NUM) {
+ 		chstatus = arm_dma_ch_getstatus(d, ch_idx);
+@@ -385,8 +452,10 @@ static irqreturn_t arm_dma350_int_handler(int irq, void *dev_id)
+ 			continue;
+ 		}
+ 
+-		arm_dma_ch_clrstatus(d, ch_idx);
+ 		p = &d->phy[ch_idx];
++		hwoff = (p->vchan && p->vchan->cyclic) ?
++			arm_dma350_cyclic_hw_offset(p->vchan, p) : -1;
++		arm_dma_ch_clrstatus(d, ch_idx);
+ 		if (p == NULL) {
+ 			ch_idx++;
+ 			continue;
+@@ -398,6 +467,7 @@ static irqreturn_t arm_dma350_int_handler(int irq, void *dev_id)
+ 				desnum[ch_idx]++;
+ 				if (dmachan[ch_idx] == (desnum[ch_idx] - 1))
+ 					desnum[ch_idx] = 1;
++				arm_dma350_cyclic_resync(c, hwoff, ch_idx);
+ 				if (p->ds_run != NULL)
+ 					vchan_cyclic_callback(&p->ds_run->vd);
+ 			} else {
+@@ -823,7 +893,7 @@ static int arm_dma350_find_idle_channel(struct dma_chan *chan)
+ 			continue;
+ 
+ 		if (atomic_cmpxchg(&vaild_chan_id[ch_idx], 0, 1) == 0) {
+-			dev_info(d->slave.dev, "use dynamic channel-%d \n", ch_idx);
++			dev_dbg(d->slave.dev, "use dynamic channel-%d\n", ch_idx);
+ 			c->id = ch_idx;
+ 			break;
+ 		}
+@@ -851,7 +921,7 @@ static int arm_dma350_cmdlink_cfg_create(u32 chan_id, u32 periods)
+ 		return -ENOMEM;
+ 	}
+ 
+-	pr_info("Channel %d initialized with %d periods\n", chan_id, periods);
++	pr_debug("Channel %d initialized with %d periods\n", chan_id, periods);
+ 	return 0;
+ }
+ 
+@@ -916,6 +986,9 @@ static struct dma_async_tx_descriptor *arm_dma350_prep_dma_cyclic(struct dma_cha
+ 	}
+ 
+ 	c->cyclic = 1;
++	c->cyc_len = 0;		/* set below once the ring address is known */
++	c->cyc_period = period_len;
++	c->cyc_mem_to_dev = (dir == DMA_MEM_TO_DEV);
+ 	while (buf < buf_len) {
+ 		if (cmd_num > 0)
+ 			dma350_cmdlink_init(&cmdlink_cfg[c->id][cmd_num]);
+@@ -947,6 +1020,8 @@ static struct dma_async_tx_descriptor *arm_dma350_prep_dma_cyclic(struct dma_cha
+ 			}
+ 
+ 		}
++		if (cmd_num == 0)
++			c->cyc_start = (dir == DMA_MEM_TO_DEV) ? (u32)src : (u32)dst;
+ 		dma_addr += period_len;
+ 		buf += period_len;
+ 
+@@ -977,6 +1052,7 @@ static struct dma_async_tx_descriptor *arm_dma350_prep_dma_cyclic(struct dma_cha
+ 	}
+ 	dmachan[c->id] = num_periods;
+ 	ds->size = buf_len;
++	c->cyc_len = num_periods * period_len;
+ 
+ 	return vchan_tx_prep(&c->vc, &ds->vd, flags);
+ }
+@@ -1015,6 +1091,7 @@ static int arm_dma350_terminate_all(struct dma_chan *chan)
+ 	p = &d->phy[c->id];
+ 
+ 	desnum[c->id] = 0;
++	c->cyc_len = 0;
+ 
+ 	/* Prevent this channel being scheduled */
+ 	spin_lock(&d->lock);

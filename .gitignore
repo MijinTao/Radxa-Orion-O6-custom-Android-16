@@ -1,2 +1,5 @@
 # Build output (created by build.ps1 / build.sh)
 /output/
+
+# Flash logs (flash.ps1 / flash.sh write flash-<date>-<time>.log next to the images they flash)
+flash-*.log

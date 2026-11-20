@@ -1,0 +1,117 @@
+Backport from mainline Linux (CIX upstreaming, "Reset" row of the wiki,
+7cd3ca90d92 "reset: add Sky1 soc reset support" v7.1, and b5fa9d3beec
+"reset: cix: add sky1 audss auxiliary reset driver").
+
+The vendor reset drivers only wait in .reset(); .assert() and .deassert() return
+immediately. Most CIX drivers (I2C, SPI, I3C, DMA-350, ...) reset their block with
+reset_control_assert() immediately followed by reset_control_deassert(), so the
+reset pulse was only as long as two register writes, and the block could be
+touched right after leaving reset. The mainline drivers hold the line for
+50-100 us after every assert and every deassert; do the same here (busy-wait
+instead of sleeping when called from atomic context).
+
+Covers the S0 system reset controller ("cix,sky1-src"), the FCH controller
+("cix,sky1-src-fch") and the audio subsystem controller ("cix,sky1-audss-reset").
+The signal tables were compared with mainline and are identical.
+
+diff --git a/drivers/reset/reset-sky1-audss.c b/drivers/reset/reset-sky1-audss.c
+index c91fb0096..01073fc6e 100644
+--- a/drivers/reset/reset-sky1-audss.c
++++ b/drivers/reset/reset-sky1-audss.c
+@@ -18,6 +18,23 @@
+ #define SKY1_RESET_SLEEP_MIN_US		10000
+ #define SKY1_RESET_SLEEP_MAX_US		20000
+ 
++/*
++ * Minimum time a reset line is held after each assert and each deassert, as in
++ * the mainline Sky1 reset drivers. Callers commonly do assert() immediately
++ * followed by deassert(); without a delay the block may see a pulse that is too
++ * short to reset it, or be accessed before it has left reset.
++ */
++#define SKY1_RESET_PULSE_MIN_US		50
++#define SKY1_RESET_PULSE_MAX_US		100
++
++static void sky1_audss_reset_pulse_delay(void)
++{
++	if (preemptible())
++		usleep_range(SKY1_RESET_PULSE_MIN_US, SKY1_RESET_PULSE_MAX_US);
++	else
++		udelay(SKY1_RESET_PULSE_MIN_US);
++}
++
+ struct sky1_rst_signal {
+ 	unsigned int offset, bit;
+ };
+@@ -103,13 +120,19 @@ static int sky1_audss_reset(struct reset_controller_dev *rcdev,
+ static int sky1_audss_reset_assert(struct reset_controller_dev *rcdev,
+ 				   unsigned long id)
+ {
+-	return sky1_audss_reset_set(rcdev, id, true);
++	int ret = sky1_audss_reset_set(rcdev, id, true);
++
++	sky1_audss_reset_pulse_delay();
++	return ret;
+ }
+ 
+ static int sky1_audss_reset_deassert(struct reset_controller_dev *rcdev,
+ 				     unsigned long id)
+ {
+-	return sky1_audss_reset_set(rcdev, id, false);
++	int ret = sky1_audss_reset_set(rcdev, id, false);
++
++	sky1_audss_reset_pulse_delay();
++	return ret;
+ }
+ 
+ static int sky1_audss_reset_status(struct reset_controller_dev *rcdev,
+diff --git a/drivers/reset/reset-sky1.c b/drivers/reset/reset-sky1.c
+index 7b1850045..f09e96a00 100644
+--- a/drivers/reset/reset-sky1.c
++++ b/drivers/reset/reset-sky1.c
+@@ -19,6 +19,24 @@
+ 
+ #define SKY1_RESET_SLEEP_MIN_US		10000
+ #define SKY1_RESET_SLEEP_MAX_US		20000
++
++/*
++ * Minimum time a reset line is held after each assert and each deassert, as in
++ * the mainline Sky1 reset drivers. Callers commonly do assert() immediately
++ * followed by deassert(); without a delay the block may see a pulse that is too
++ * short to reset it, or be accessed before it has left reset.
++ */
++#define SKY1_RESET_PULSE_MIN_US		50
++#define SKY1_RESET_PULSE_MAX_US		100
++
++static void sky1_reset_pulse_delay(void)
++{
++	if (preemptible())
++		usleep_range(SKY1_RESET_PULSE_MIN_US, SKY1_RESET_PULSE_MAX_US);
++	else
++		udelay(SKY1_RESET_PULSE_MIN_US);
++}
++
+ struct sky1_src_signal {
+ 	unsigned int offset, bit;
+ };
+@@ -297,13 +315,19 @@ static int sky1_reset(struct reset_controller_dev *rcdev,
+ static int sky1_reset_assert(struct reset_controller_dev *rcdev,
+ 			     unsigned long id)
+ {
+-	return sky1_reset_set(rcdev, id, true);
++	int ret = sky1_reset_set(rcdev, id, true);
++
++	sky1_reset_pulse_delay();
++	return ret;
+ }
+ 
+ static int sky1_reset_deassert(struct reset_controller_dev *rcdev,
+ 			       unsigned long id)
+ {
+-	return sky1_reset_set(rcdev, id, false);
++	int ret = sky1_reset_set(rcdev, id, false);
++
++	sky1_reset_pulse_delay();
++	return ret;
+ }
+ 
+ static int sky1_reset_status(struct reset_controller_dev *rcdev,

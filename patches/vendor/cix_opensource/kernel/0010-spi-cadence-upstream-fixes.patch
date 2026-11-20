@@ -1,0 +1,215 @@
+Backport from mainline Linux ("SPI" row of the CIX upstream wiki; the Sky1 SPI
+controllers use the Cadence SPI driver, cix,sky1-spi-r1p6 / cdns,spi-r1p6).
+The vendor driver keeps its own "fifo-width" (32-bit FIFO) support; these
+mainline fixes are ported on top of it:
+
+- 633cd6fe6e1 "spi: spi-cadence: Reverse the order of interleaved write and
+  read operations": the interrupt handler refilled the TX FIFO before draining
+  the RX FIFO, so on transfers longer than the FIFO received words were pushed
+  out of a full RX FIFO and lost (corrupted reads from SPI flash, displays,
+  ADCs, spidev on the 40-pin header).
+- d9eadfce2fa "spi: spi-cadence: Move TX FIFO full busy-wait into FIFO": the
+  TX-FIFO-full back-off was done once per transfer instead of per FIFO entry,
+  so writes could be dropped while refilling and the transfer then timed out.
+- 666fa7e9ca9 "spi: cadence: fix controller deregistration",
+  5b1689a41f0 "spi: cadence: fix unclocked access on unbind",
+  ecea4f0e9db "spi: cadence: fix clock imbalance on probe failure":
+  unregister the controller before disabling it, resume it before touching its
+  registers on unbind (an unclocked register access can hang the SoC), and keep
+  runtime PM / clock counts balanced on probe failure (also fixes a vendor-only
+  leak of the manually enabled ref_clk on probe failure and on unbind).
+
+diff --git a/drivers/spi/spi-cadence.c b/drivers/spi/spi-cadence.c
+index 39a0cf028..d15e581b0 100644
+--- a/drivers/spi/spi-cadence.c
++++ b/drivers/spi/spi-cadence.c
+@@ -310,11 +310,13 @@ static int cdns_spi_setup_transfer(struct spi_device *spi,
+ 
+ /**
+  * cdns_spi_process_fifo - Fills the TX FIFO, and drain the RX FIFO
++ * @ctlr:	Pointer to the spi_controller structure
+  * @xspi:	Pointer to the cdns_spi structure
+  * @ntx:	Number of bytes to pack into the TX FIFO
+  * @nrx:	Number of bytes to drain from the RX FIFO
+  */
+-static void cdns_spi_process_fifo(struct cdns_spi *xspi, int ntx, int nrx)
++static void cdns_spi_process_fifo(struct spi_controller *ctlr,
++				  struct cdns_spi *xspi, int ntx, int nrx)
+ {
+ 	unsigned int w_data = 0;
+ 
+@@ -329,23 +331,11 @@ static void cdns_spi_process_fifo(struct cdns_spi *xspi, int ntx, int nrx)
+ 	nrx = DIV_ROUND_UP(nrx, w_data);
+ 
+ 	while (ntx || nrx) {
+-		if (ntx) {
+-			if (xspi->txbuf) {
+-				if (xspi->fifo_width == 8) {
+-					cdns_spi_write(xspi, CDNS_SPI_TXD, *(u8 *)xspi->txbuf);
+-					xspi->txbuf = (u8 *)xspi->txbuf + 1;
+-				} else if (xspi->fifo_width == 32){
+-					cdns_spi_write(xspi, CDNS_SPI_TXD, *(u32 *)xspi->txbuf);
+-					xspi->txbuf = (u32 *)xspi->txbuf + 1;
+-				} else {
+-					pr_warn("Unexpected FIFO width %d\n", xspi->fifo_width);
+-					break;
+-				}
+-			} else {
+-				cdns_spi_write(xspi, CDNS_SPI_TXD, 0);
+-			}
+-			ntx--;
+-		}
++		/*
++		 * Drain RX before refilling TX: writing TX first lets the
++		 * controller push received words out of a full RX FIFO, which
++		 * silently loses data on transfers longer than the FIFO.
++		 */
+ 		if (nrx) {
+ 			u32 data = cdns_spi_read(xspi, CDNS_SPI_RXD);
+ 
+@@ -363,6 +353,34 @@ static void cdns_spi_process_fifo(struct cdns_spi *xspi, int ntx, int nrx)
+ 			}
+ 			nrx--;
+ 		}
++
++		if (ntx) {
++			/*
++			 * When the controller is busy, a write to a full TX FIFO
++			 * is lost and the transfer never completes. Back off for
++			 * one byte time per FIFO entry. Only in host mode: in
++			 * target mode the delay makes the target miss its window.
++			 */
++			if (!spi_controller_is_target(ctlr) &&
++			    (cdns_spi_read(xspi, CDNS_SPI_ISR) & CDNS_SPI_IXR_TXFULL))
++				udelay(10);
++
++			if (xspi->txbuf) {
++				if (xspi->fifo_width == 8) {
++					cdns_spi_write(xspi, CDNS_SPI_TXD, *(u8 *)xspi->txbuf);
++					xspi->txbuf = (u8 *)xspi->txbuf + 1;
++				} else if (xspi->fifo_width == 32){
++					cdns_spi_write(xspi, CDNS_SPI_TXD, *(u32 *)xspi->txbuf);
++					xspi->txbuf = (u32 *)xspi->txbuf + 1;
++				} else {
++					pr_warn("Unexpected FIFO width %d\n", xspi->fifo_width);
++					break;
++				}
++			} else {
++				cdns_spi_write(xspi, CDNS_SPI_TXD, 0);
++			}
++			ntx--;
++		}
+ 	}
+ }
+ 
+@@ -405,14 +423,14 @@ static irqreturn_t cdns_spi_irq(int irq, void *dev_id)
+ 		w_data = xspi->fifo_width / BITS_PER_BYTE;
+ 
+ 		if (xspi->tx_bytes) {
+-			cdns_spi_process_fifo(xspi, trans_cnt, trans_cnt);
++			cdns_spi_process_fifo(master, xspi, trans_cnt, trans_cnt);
+ 		} else {
+ 			/* Fixed delay due to controller limitation with
+ 			 * RX_NEMPTY incorrect status
+ 			 * Xilinx AR:65885 contains more details
+ 			 */
+ 			udelay(10);
+-			cdns_spi_process_fifo(xspi, 0, trans_cnt);
++			cdns_spi_process_fifo(master, xspi, 0, trans_cnt);
+ 			cdns_spi_write(xspi, CDNS_SPI_IDR,
+ 				       CDNS_SPI_IXR_DEFAULT);
+ 			spi_finalize_current_transfer(master);
+@@ -466,14 +484,8 @@ static int cdns_transfer_one(struct spi_controller *ctlr,
+ 			cdns_spi_write(xspi, CDNS_SPI_THLD, xspi->tx_fifo_depth >> 1);
+ 	}
+ 
+-	/* When xspi in busy condition, bytes may send failed,
+-	 * then spi control didn't work thoroughly, add one byte delay
+-	 */
+-	if (cdns_spi_read(xspi, CDNS_SPI_ISR) & CDNS_SPI_IXR_TXFULL)
+-		udelay(10);
+-
+ 	ntx = xspi->tx_fifo_depth * xspi->fifo_width / BITS_PER_BYTE;
+-	cdns_spi_process_fifo(xspi, ntx, 0);
++	cdns_spi_process_fifo(ctlr, xspi, ntx, 0);
+ 
+ 	cdns_spi_write(xspi, CDNS_SPI_IER, CDNS_SPI_IXR_DEFAULT);
+ 	return transfer->len;
+@@ -627,7 +639,7 @@ static int cdns_spi_probe(struct platform_device *pdev)
+ 	if (IS_ERR(xspi->spi_reset)) {
+ 		dev_err(&pdev->dev, "[%s:%d]get reset error\n", __func__, __LINE__);
+ 		ret = PTR_ERR(xspi->spi_reset);
+-		goto clk_dis_all;
++		goto clk_dis_ref;
+ 	}
+ 	/* reset */
+ 	reset_control_assert(xspi->spi_reset);
+@@ -690,24 +702,28 @@ static int cdns_spi_probe(struct platform_device *pdev)
+ 	if (!device_property_read_u32(&pdev->dev, "fifo-width", &xspi->fifo_width))
+ 		ctlr->bits_per_word_mask |= SPI_BPW_RANGE_MASK(8, xspi->fifo_width);
+ 
+-	pm_runtime_mark_last_busy(&pdev->dev);
+-	pm_runtime_put_autosuspend(&pdev->dev);
+-
+ 	ret = spi_register_master(ctlr);
+ 	if (ret) {
+ 		dev_err(&pdev->dev, "spi_register_controller failed\n");
+ 		goto clk_dis_all;
+ 	}
+ 
++	/* Only allow runtime suspend once registration succeeded */
++	pm_runtime_mark_last_busy(&pdev->dev);
++	pm_runtime_put_autosuspend(&pdev->dev);
++
+ 	dev_info(&pdev->dev, "Successfully registered SPI master\n");
+ 
+ 	return ret;
+ 
+ clk_dis_all:
+-	if (!spi_controller_is_target(ctlr)) {
+-		pm_runtime_disable(&pdev->dev);
+-		pm_runtime_set_suspended(&pdev->dev);
+-	}
++	/* Runtime PM was enabled unconditionally above; the device is active */
++	pm_runtime_disable(&pdev->dev);
++	pm_runtime_set_suspended(&pdev->dev);
++	pm_runtime_put_noidle(&pdev->dev);
++	pm_runtime_dont_use_autosuspend(&pdev->dev);
++clk_dis_ref:
++	clk_disable_unprepare(xspi->ref_clk);
+ remove_ctlr:
+ 	spi_controller_put(ctlr);
+ 	return ret;
+@@ -725,15 +741,27 @@ static void cdns_spi_remove(struct platform_device *pdev)
+ {
+ 	struct spi_controller *ctlr = platform_get_drvdata(pdev);
+ 	struct cdns_spi *xspi = spi_controller_get_devdata(ctlr);
++	int ret;
+ 
+-	cdns_spi_write(xspi, CDNS_SPI_ER, CDNS_SPI_ER_DISABLE);
++	/* Make sure the controller is clocked before touching it */
++	ret = pm_runtime_get_sync(&pdev->dev);
+ 
+-	if (!spi_controller_is_target(ctlr)) {
+-		pm_runtime_disable(&pdev->dev);
+-		pm_runtime_set_suspended(&pdev->dev);
+-	}
++	spi_controller_get(ctlr);
+ 
+ 	spi_unregister_controller(ctlr);
++
++	if (ret >= 0) {
++		cdns_spi_write(xspi, CDNS_SPI_ER, CDNS_SPI_ER_DISABLE);
++		/* ref_clk is enabled by hand in probe, pclk is devm-managed */
++		clk_disable_unprepare(xspi->ref_clk);
++	}
++
++	pm_runtime_disable(&pdev->dev);
++	pm_runtime_set_suspended(&pdev->dev);
++	pm_runtime_put_noidle(&pdev->dev);
++	pm_runtime_dont_use_autosuspend(&pdev->dev);
++
++	spi_controller_put(ctlr);
+ }
+ 
+ /**
