@@ -2,10 +2,10 @@
 
 Android 16 for the **Radxa Orion O6**, built in Docker from CIX's public Android 16 sources
 ([cixtech/android-manifest](https://github.com/cixtech/android-manifest), branch `cix_android16_2025q3_dev`,
-"Android16 + k6.6 + 2025Q3 Rc4.2") plus fourteen patches: six that make Wi-Fi, Bluetooth and `adb reboot bootloader`
+"Android16 + k6.6 + 2025Q3 Rc4.2") plus seventeen patches: six that make Wi-Fi, Bluetooth and `adb reboot bootloader`
 work, fix the board's freezes and add a mouse-click-as-touch option, six kernel fixes backported from mainline
-Linux, where CIX is upstreaming the P1 (Sky1) drivers (see [Mainline backports](#mainline-backports)), and two fixes for DP
-audio turning robotic and then silent.
+Linux, where CIX is upstreaming the P1 (Sky1) drivers (see [Mainline backports](#mainline-backports)), two fixes for DP
+audio turning robotic and then silent, and three more fixes taken from CIX's mainline work (HD audio, USB-C, USB3).
 
 **Tested on a Radxa Orion O6 with the `Android-1.3.2-dmod` BIOS from
 [Radxa-Orion-O6-custom-BIOS](https://github.com/MijinTao/Radxa-Orion-O6-custom-BIOS). The Orion O6N is not supported (see [Orion O6N](#orion-o6n)).**
@@ -135,10 +135,13 @@ every build, so rebuilding always starts clean.
 | 0010 | `spi-cadence-upstream-fixes` | kernel | **SPI data integrity** (mainline 633cd6fe6e1, d9eadfce2fa, 666fa7e9ca9, 5b1689a41f0, ecea4f0e9db). RX is drained before TX is refilled (received bytes were lost on transfers longer than the FIFO); the TX-full back-off is applied per FIFO entry (transfers could stall and time out); unbind and probe failure no longer touch an unclocked controller or unbalance its clocks. |
 | 0011 | `usb-cdnsp-upstream-fixes` | kernel | **USB-C role switching** (mainline 87c5ff5615d, 87e4b043b98, 3348f444a4c). Fixes a use-after-free each time the USB-C port leaves device (ADB) mode, a NULL dereference on resume when the role changed during suspend, and a DMA memory leak on a failed USB3 streams endpoint setup. |
 | 0012 | `scmi-perf-check-allowed-ops` | kernel | **No needless DVFS requests to the SCP** (mainline 189df98777a, by CIX). Level/limit changes that the firmware reports as not allowed for a performance domain are refused locally instead of being sent to the SCP and rejected. |
-| 0013 | `dma350-cyclic-lost-period-resync` | kernel | **DP audio turning robotic, then silent** (O6 fix, not from mainline). The audio DMA tracked the playback position only by counting period interrupts; when one was held off for more than a period (5.3 ms) the position fell behind for good, until the DMA played stale data. The count is now resynchronised from the channel's address register on every interrupt; misses are counted in `/sys/module/arm_dma350/parameters/lost_periods`. |
+| 0013 | `dma350-cyclic-lost-period-resync` | kernel | **DP audio turning robotic, then silent.** The audio DMA tracked the playback position only by counting period interrupts; when one was held off for more than a period (5.3 ms) the position fell behind for good, until the DMA played stale data. The position is now read from the hardware (current linked command + what is left of it), the same method as CIX's own pending mainline DMA-350 cyclic support; the interrupt count stays as a fallback and is resynchronised, misses counted in `/sys/module/arm_dma350/parameters/lost_periods`. |
 | 0014 | `serial-console-quiet` | `device/cix` | **Quiet serial console** (kernel command line `loglevel=4`). Every kernel message used to go out over the 115200-baud UART, and each line kept interrupts off on one CPU for ~10 ms; that made the audio DMA miss period interrupts. Now only errors and worse go to the UART; `dmesg`, `logcat` and the pstore log still have everything, and an oops/panic still prints in full. `-VerboseConsole` / `--verbose-console` builds without this patch. |
+| 0015 | `hda-reset-response-counter-on-timeout` | kernel | **3.5 mm jack audio that stops responding** (mainline 51ee6ce2418, which names the CIX HDA controller). After one lost codec reply, every later command to the ALC256 codec waited the full 1 s timeout and failed (jack detection, volume, stream start). The pending-reply count is now reset on a timeout. |
+| 0016 | `typec-rts5453-shared-irq-fixes` | kernel | **USB-C ports disturbing each other** (from CIX's pending mainline PD driver, v7). Both RTS5453 PD controllers share one interrupt; every event reprogrammed both ports' orientation switch and USB/DP mux. Now a port is only reprogrammed when its own status changes; pending interrupts are acknowledged at probe/resume; no more status dump per interrupt. |
+| 0017 | `usb-cdnsp-sky1-d3-and-suspend-fixes` | kernel | **USB3 controller power-state fixes** (from CIX's pending mainline glue driver, v9). A failed D3 entry puts the controller back into D0 instead of half way; PME wake-up only when asked for; system suspend only gates the controller clocks once it has really stopped (gating a running controller can hang the bus); the per-autosuspend log lines are debug level. |
 
-All patches together change 28 files; the build checks that each one is in the result (kernel config, drivers,
+All patches together change 34 files; the build checks that each one is in the result (kernel config, drivers,
 firmware, the input library) and stops if one is missing.
 
 ## Mainline backports
@@ -169,6 +172,24 @@ patches 0007–0012. Each patch file starts with a description and the upstream 
 | DMA (v7.3) | Not applicable: mainline uses Arm's `arm-dma350` driver (no audio/cyclic support); the vendor kernel has CIX's own DMA-350 driver, fixed separately in **0013**. |
 | USB (reviewing) | **0011** (Cadence USBSSP core fixes); 11 other mainline cdnsp/xhci fixes are already in the vendor tree. |
 | USB3/DP PHY, I2S, DP, GPU (planning) | Nothing merged yet. |
+
+### Pending CIX work (lore.kernel.org, checked 23 Nov 2026)
+
+Series CIX has posted but that are not merged yet, and what came of them:
+
+| Series | Result for this kernel |
+|---|---|
+| `dmaengine: arm-dma350: Add slave support and Sky1 integration` (v7) | Its cyclic position code (from `CH_LINKADDR` + `CH_XSIZE`, "since multiple period completions may share a pending DONE interrupt") is the method **0013** now uses. The other fixes in it are for the mainline driver's own code (the vendor driver's trigger bits are already right). |
+| `usb: typec: add CIX Type-C PD controller driver` (v7) | **0016** (same chips, vendor `rts5453.c`). |
+| `usb: cdns3: Add CIX Sky1 glue driver` (v9) | **0017** (vendor `cdnsp-sky1.c`). |
+| `soc: cix: Add the Sky1 AUDSS DMA-350 interrupt path` (v5) | Not needed: the vendor DMA driver programs the AUDSS interrupt gate itself on every stream setup. |
+| `ASoC: cdns: Add Cadence I2S-SC and I2S-MC` (v5) | Nothing to port: same FIFO reset, clock selection and clock-ratio checks as the vendor `cdns_i2s_mc.c`. |
+| `drm/cix: add Sky1 DisplayPort transmitter` (v2) | Not applicable: no audio support yet, much less complete than the vendor `trilin_dptx` driver. |
+| `phy: cix: Sky1 DP PHY` (v5), `USB/DP combo PHY` (v2), `USB3 PHY` (v8) | Not applicable: new drivers with new bindings; the DP PHY review fix (PLL left off after a bad link rate) doesn't apply, the vendor PHY re-enables the PLL. |
+| `drm/panthor: CIX Sky1` GPU (v3) | Not applicable: Android uses Arm's Mali kbase driver. |
+| `ALSA: hda: Wait for PCM files on codec teardown` (v4) | Not needed: only matters when an HDA codec driver is unbound at runtime. |
+| `arm64: dts: cix: fix I2C bus address and size cells` (v3) | Already right in the vendor device tree. |
+| `perf: arm_pmu_acpi` / `arm_spe` heterogeneous ACPI | Not applicable: the Android image boots with a device tree, not ACPI. |
 
 ## Orion O6N
 

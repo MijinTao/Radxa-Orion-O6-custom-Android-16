@@ -1,0 +1,158 @@
+Backport of review fixes from CIX's pending mainline glue driver for the Sky1 USB3
+controllers: "usb: cdns3: Add CIX Sky1 glue driver" (Hongliang Yang, v9, Nov 2026, not
+merged yet; vendor file cdnsp-sky1.c), tested by CIX on the Orion O6.
+
+- D3 entry: PME wake-up (PS_PME_En) is only armed when wake-up was requested (runtime
+  suspend still arms it, a system suspend of a device not set up for wake-up no longer
+  does). If the controller doesn't reach D3 after the retries, it is put back into D0
+  with PME off instead of being left half way, and an error is returned (the vendor
+  code printed an error and carried on as if it was suspended).
+- System suspend: the AXI and SOF clocks are only gated once the controller's
+  AXI_CLOCK_VALID has dropped. In device role, or when D3 entry failed, the controller
+  is still running; gating its clocks then can hang the bus on the next access.
+  Resume only re-enables what suspend gated, so the clock counts stay balanced.
+- The D3 enter/exit and clock messages printed on every runtime suspend/resume of an
+  idle controller (several lines every few seconds per port, with the kernel address
+  of the xHCI registers) are now debug level.
+
+diff --git a/drivers/usb/cdns3/cdnsp-sky1.c b/drivers/usb/cdns3/cdnsp-sky1.c
+index 23ad42677..091fb9fc2 100644
+--- a/drivers/usb/cdns3/cdnsp-sky1.c
++++ b/drivers/usb/cdns3/cdnsp-sky1.c
+@@ -135,7 +135,7 @@ static int sky1_usb_clk_enable_resume(struct device *dev)
+ 	struct cdnsp_sky1 *data = dev_get_drvdata(dev);
+ 	struct clk **cix_usb_clks = data->cix_usb_clks;
+ 
+-	dev_info(dev, "---------sky1_usb_clk_enable_resume----------\n");
++	dev_dbg(dev, "---------sky1_usb_clk_enable_resume----------\n");
+ 
+ 	for (i = 0; i < CIX_USB_CLK_OFF_NUM; i++) {
+ 		ret = clk_prepare_enable(cix_usb_clks[i]);
+@@ -167,7 +167,7 @@ static void sky1_usb_clk_disable_suspend(struct device *dev)
+ 	int i;
+ 	struct cdnsp_sky1 *data = dev_get_drvdata(dev);
+ 	struct clk **cix_usb_clks = data->cix_usb_clks;
+-	dev_info(dev, "---------sky1_usb_clk_disable_suspend----------\n");
++	dev_dbg(dev, "---------sky1_usb_clk_disable_suspend----------\n");
+ 
+ 	for (i = 0; i < CIX_USB_CLK_OFF_NUM; i++) {
+ 		clk_disable_unprepare(cix_usb_clks[i]);
+@@ -221,26 +221,45 @@ static int cdns_sky1_platform_suspend(struct device *dev,
+ 		return 0;
+ 	}
+ 	xhci = hcd_to_xhci(hcd);
+-	dev_info(dev, "[%s:%d] xhci_dev name:%s, hcd->regs:%llx\n", __func__, __LINE__,
+-		dev_name(&xhci_dev->dev), (long long unsigned int)hcd->regs);
++	dev_dbg(dev, "[%s:%d] xhci_dev name:%s\n", __func__, __LINE__,
++		dev_name(&xhci_dev->dev));
+ 
+ 	if (suspend) {
+ 		/* SW request low power when all usb ports allow to it ??? */
+ 		while (count--) {
+ 			value = readl(hcd->regs + XECP_PM_PMCSR);
+ 			value &= ~PS_MASK;
+-			value |= PS_D3 | PS_PME_En;
++			value |= PS_D3;
++			/* only arm PME wake-up when wake-up was asked for */
++			if (wakeup)
++				value |= PS_PME_En;
++			else
++				value &= ~PS_PME_En;
+ 			writel(value, hcd->regs + XECP_PM_PMCSR);
+ 			/* after controller enter D3, disable axi and sof until axi valid flag change to 0.
+ 			 */
+ 			if (sky1_handshake(data->ctst_base, AXI_CLOCK_VALID, 0, 100 * 1000))
+-				dev_err(dev, "[%s:%d] enter D3 failed,register value:%x\n",
++				dev_dbg(dev, "[%s:%d] enter D3 failed,register value:%x\n",
+ 					__func__, __LINE__, readl(data->ctst_base));
+ 			else {
+-				dev_info(dev, "[%s:%d] enter D3 succeed\n", __func__, __LINE__);
++				dev_dbg(dev, "[%s:%d] enter D3 succeed\n", __func__, __LINE__);
+ 				break;
+ 			}
+ 		}
++		if (count < 0) {
++			/*
++			 * The controller never got to D3: put it back into D0 with
++			 * PME off instead of leaving it half way (as in CIX's
++			 * mainline glue driver, v9).
++			 */
++			dev_err(dev, "enter D3 failed after retries, register value:%x\n",
++				readl(data->ctst_base));
++			value = readl(hcd->regs + XECP_PM_PMCSR);
++			value &= ~(PS_MASK | PS_PME_En);
++			value |= PS_D0;
++			writel(value, hcd->regs + XECP_PM_PMCSR);
++			ret = -ETIMEDOUT;
++		}
+ 	} else {
+ 		while (count--) {
+ 			value = readl(hcd->regs + XECP_PM_PMCSR);
+@@ -250,13 +269,18 @@ static int cdns_sky1_platform_suspend(struct device *dev,
+ 			writel(value, hcd->regs + XECP_PM_PMCSR);
+ 			/* Wait power state back to D0 */
+ 			if (sky1_handshake(hcd->regs + XECP_PM_PMCSR, PS_MASK, 0, 100 * 1000))
+-				dev_err(dev, "[%s:%d] exit D3 timeout, power state=0x%lx\n",
++				dev_dbg(dev, "[%s:%d] exit D3 timeout, power state=0x%lx\n",
+ 					__func__, __LINE__, readl(hcd->regs + XECP_PM_PMCSR) & PS_MASK);
+ 			else {
+-				dev_info(dev, "[%s:%d] exit D3 succeed\n", __func__, __LINE__);
++				dev_dbg(dev, "[%s:%d] exit D3 succeed\n", __func__, __LINE__);
+ 				break;
+ 			}
+ 		}
++		if (count < 0) {
++			dev_err(dev, "exit D3 timeout after retries, power state=0x%lx\n",
++				readl(hcd->regs + XECP_PM_PMCSR) & PS_MASK);
++			ret = -ETIMEDOUT;
++		}
+ 	}
+ 
+ 	return ret;
+@@ -733,7 +757,21 @@ static int cdnsp_sky1_suspend(struct device *dev)
+ 
+ static int cdnsp_sky1_system_suspend(struct device *dev)
+ {
++	struct cdnsp_sky1 *data = dev_get_drvdata(dev);
++
++	/*
++	 * The controller only goes to D3 in host role, and not at all if D3
++	 * entry timed out; then it is still clocked and in use. Gate the AXI
++	 * and SOF clocks only once AXI_CLOCK_VALID has dropped (as in CIX's
++	 * mainline glue driver, v9): gating a live controller can hang the bus.
++	 */
++	data->clks_gated = false;
++	if (readl(data->ctst_base) & AXI_CLOCK_VALID) {
++		dev_dbg(dev, "controller still active, clocks left on\n");
++		return 0;
++	}
+ 	sky1_usb_clk_disable_suspend(dev);
++	data->clks_gated = true;
+ 	return 0;
+ }
+ 
+@@ -742,8 +780,11 @@ static int cdnsp_sky1_system_resume(struct device *dev)
+ 	int ret = 0;
+ 	struct cdnsp_sky1 *data;
+ 
+-	ret = sky1_usb_clk_enable_resume(dev);
+ 	data = dev_get_drvdata(dev);
++	if (data->clks_gated) {
++		ret = sky1_usb_clk_enable_resume(dev);
++		data->clks_gated = false;
++	}
+ 	writel(CIX_USB_AXI_WR_CACHE_VALUE, data->axi_base);
+ 	return ret;
+ }
+diff --git a/drivers/usb/cdns3/cdnsp-sky1.h b/drivers/usb/cdns3/cdnsp-sky1.h
+index 767cc6581..44f68b6b5 100644
+--- a/drivers/usb/cdns3/cdnsp-sky1.h
++++ b/drivers/usb/cdns3/cdnsp-sky1.h
+@@ -110,6 +110,7 @@ struct cdnsp_sky1 {
+ 	struct reset_control *reset;
+ 	struct reset_control *preset;
+ 	struct clk *cix_usb_clks[CIX_USB_CLK_NUM];
++	bool clks_gated;	/* system suspend gated the AXI/SOF clocks */
+ 	int id;
+ 	struct regmap	*usb_syscon;
+ 	int lpm_clk_freq;
