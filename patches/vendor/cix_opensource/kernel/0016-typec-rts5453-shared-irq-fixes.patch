@@ -1,0 +1,201 @@
+Backport of review fixes from CIX's pending mainline driver for the same chips:
+"usb: typec: add CIX Type-C PD controller driver" (Gary Yang, v7, Nov 2026, not merged
+yet; mainline name cix_pd.c, here the vendor rts5453.c). The Orion O6 has two Realtek
+RTS5453H PD controllers (USB-C ports) on one shared, level-triggered interrupt line.
+
+- Every interrupt runs both ports' handlers, and the vendor driver reprogrammed its
+  port each time: orientation switch, USB/DP lane mux and power role, even when the
+  interrupt was for the other port. Re-setting an unchanged mux can disturb a running
+  USB3 or DisplayPort alt-mode link on the other USB-C port. A port is now only
+  reprogrammed when its own decoded status changed or an HPD event arrived (or at
+  probe/resume); HPD_IRQ is handled as an event and left out of the comparison (it
+  stays set until acknowledged). A failed update invalidates the cached status so it
+  is retried.
+- The handler returns IRQ_NONE when its controller had nothing new, so the interrupt
+  core can still catch a line stuck asserted, instead of disabling the shared line on
+  an I2C error (which also silenced the other port).
+- Probe acknowledges an interrupt raised before the IRQ was requested, so the first
+  controller to probe doesn't spin on a line the second one still holds low; resume
+  reads back and acknowledges the status before unmasking the line.
+- The 6-byte status dump on every interrupt is now dev_dbg.
+
+diff --git a/drivers/usb/typec/rts5453.c b/drivers/usb/typec/rts5453.c
+index 9f7547660..5b7d66e39 100644
+--- a/drivers/usb/typec/rts5453.c
++++ b/drivers/usb/typec/rts5453.c
+@@ -68,6 +68,8 @@ struct rts5453h {
+ 	u8 i2c_protocol:1;	/*i2c or smbus*/
+ 	int id;
+ 	u8 data_status[DATA_STATUS_COUNT];
++	u8 prev_status[DATA_STATUS_COUNT];	/* last status the port was programmed for */
++	bool status_valid;
+ 	struct typec_mux_state state;
+ 	struct typec_capability caps;
+ 	struct typec_switch *ori_sw;
+@@ -294,9 +296,22 @@ static void rts5453h_typec_register_port_altmodes(struct rts5453h *typec)
+ 	typec->desc.usb_pd = 0;
+ }
+ 
+-static int rts5453h_event_handler(struct rts5453h *rts, u8 clear_irq)
++/*
++ * Returns < 0 on an I2C error, 1 if the port status changed or an HPD event
++ * arrived, 0 if nothing changed for this port.
++ *
++ * Both Type-C controllers of the board share one level-triggered interrupt
++ * line, so every event of one port also runs the other port's handler. The
++ * port (orientation switch, USB/DP lane mux, roles) is only reprogrammed when
++ * its own decoded status changed, an HPD event arrived, or @force is set
++ * (probe, resume): re-setting an unchanged mux could disturb the USB3/DP link
++ * of the other port. As in CIX's mainline driver ("usb: typec: add CIX Type-C
++ * PD controller driver", v5-v7).
++ */
++static int rts5453h_event_handler(struct rts5453h *rts, u8 clear_irq, bool force)
+ {
+-	int ret = 0;
++	int ret = 0, err;
++	bool hpd_irq, changed;
+ 	u8 data_control[3] = {0};
+ 
+ 	mutex_lock(&rts->lock);
+@@ -306,39 +321,57 @@ static int rts5453h_event_handler(struct rts5453h *rts, u8 clear_irq)
+ 		data_control[2] = 0;
+ 
+ 		ret = rts5453h_block_write(rts, RTS_DATA_CONTROL, data_control, 3);
+-		if (ret != 0 ) {
+-				goto i2c_err;
+-		}
++		if (ret != 0)
++			goto i2c_err;
+ 	}
+ 
+ 	ret = rts5453h_block_read(rts, RTS_DATA_STATUS, rts->data_status, 6);
+-	if (ret != 0 ) {
++	if (ret != 0)
+ 		goto i2c_err;
+-	} else {
+-		dev_info(rts->dev, "typec port(%d):data status = 0x%x , 0x%x, 0x%x, 0x%x, 0x%x, 0x%x\n",
+-			rts->id, rts->data_status[0], rts->data_status[1], rts->data_status[2], rts->data_status[3], rts->data_status[4], rts->data_status[5]);
+-	}
+ 
+-	rts5453h_typec_port_update(rts);
++	dev_dbg(rts->dev, "typec port(%d):data status = 0x%x , 0x%x, 0x%x, 0x%x, 0x%x, 0x%x\n",
++		rts->id, rts->data_status[0], rts->data_status[1], rts->data_status[2],
++		rts->data_status[3], rts->data_status[4], rts->data_status[5]);
+ 
+-	if (rts->data_status[2] & HPD_IRQ) {
++	/*
++	 * HPD_IRQ stays set until it is acknowledged below, so it is handled as
++	 * an event of its own and left out of the comparison. Bytes 0, 4 and 5
++	 * are not decoded.
++	 */
++	hpd_irq = rts->data_status[2] & HPD_IRQ;
++	changed = !rts->status_valid ||
++		  rts->data_status[1] != rts->prev_status[1] ||
++		  (rts->data_status[2] & ~HPD_IRQ) != (rts->prev_status[2] & ~HPD_IRQ) ||
++		  rts->data_status[3] != rts->prev_status[3];
++	memcpy(rts->prev_status, rts->data_status, DATA_STATUS_COUNT);
++	rts->status_valid = true;
++
++	if (changed || hpd_irq || force) {
++		err = rts5453h_typec_port_update(rts);
++		if (err) {
++			/* retry on the next interrupt or resume */
++			rts->status_valid = false;
++			dev_err(rts->dev, "typec port(%d): failed to update port: %d\n",
++				rts->id, err);
++		}
++	}
++
++	if (hpd_irq) {
+ 		data_control[0] = 2;
+ 		data_control[1] = 0;
+ 		data_control[2] = HPD_IRQ_ACK;
+ 		ret = rts5453h_block_write(rts, RTS_DATA_CONTROL, data_control, 3);
+-		if (ret != 0 ) {
++		if (ret != 0)
+ 			goto i2c_err;
+-		}
+ 	}
+ 
+-i2c_err:
+-	if (ret != 0 ) {
+-		dev_err(rts->dev, "typec port(%d):i2c transfer error = %d, disable irq\n", rts->id, ret);
+-		ret = -ESHUTDOWN;
+-	}
++	mutex_unlock(&rts->lock);
++	return (changed || hpd_irq) ? 1 : 0;
+ 
++i2c_err:
++	dev_err(rts->dev, "typec port(%d):i2c transfer error = %d\n", rts->id, ret);
+ 	mutex_unlock(&rts->lock);
+-	return ret;
++	return ret < 0 ? ret : -EIO;
+ }
+ 
+ static int rts5453h_typec_parse_port_props(struct typec_capability *cap,
+@@ -414,12 +447,14 @@ static irqreturn_t rts5453h_irq_handle(int irq, void *data)
+ 	struct rts5453h *rts = (struct rts5453h *)data;
+ 	int ret;
+ 
+-	ret = rts5453h_event_handler(rts, 1);
+-
+-	if (ret == -ESHUTDOWN)
+-		disable_irq_nosync(irq);
++	/*
++	 * Shared level-triggered line: report IRQ_NONE when this controller had
++	 * nothing new, so the interrupt core can still detect and disable a line
++	 * that a broken sibling keeps asserted.
++	 */
++	ret = rts5453h_event_handler(rts, 1, false);
+ 
+-	return IRQ_HANDLED;
++	return ret > 0 ? IRQ_HANDLED : IRQ_NONE;
+ }
+ 
+ static int rts5453h_init_ports(struct rts5453h *typec)
+@@ -549,8 +584,13 @@ static int rts5453h_probe(struct i2c_client *client)
+ 	if (ret)
+ 		return -EPROBE_DEFER;
+ 
+-	ret = rts5453h_event_handler(rts, 0);
+-	if (ret) {
++	/*
++	 * Acknowledge an interrupt raised before the IRQ is requested, so this
++	 * controller doesn't keep the shared line asserted, and program the port
++	 * once.
++	 */
++	ret = rts5453h_event_handler(rts, 1, true);
++	if (ret < 0) {
+ 		dev_err(&client->dev, "typec event handling error %d", ret);
+ 		return ret;
+ 	}
+@@ -635,10 +675,17 @@ static int rts5453h_resume(struct device *dev)
+ {
+ 	struct i2c_client *client = to_i2c_client(dev);
+ 
++	struct rts5453h *rts = i2c_get_clientdata(client);
++
+ 	if (device_may_wakeup(dev)) {
+ 		disable_irq_wake(client->irq);
+-		dev_info(&client->dev, "enable irq");
++		dev_dbg(&client->dev, "enable irq");
+ 	}
++	/*
++	 * Read back (and acknowledge) what happened while suspended before
++	 * unmasking the level-triggered line, so a pending event can't loop.
++	 */
++	rts5453h_event_handler(rts, 1, true);
+ 	enable_irq(client->irq);
+ 
+ 	return 0;
+@@ -657,8 +704,8 @@ static int rts5453h_restore(struct device *dev)
+ 	enable_irq(client->irq);
+ 
+ 	/* Re-trigger PD event if PD event occurs during std */
+-	ret = rts5453h_event_handler(rts, 0);
+-	if (ret) {
++	ret = rts5453h_event_handler(rts, 0, true);
++	if (ret < 0) {
+ 		dev_err(&client->dev, "typec event handling error %d", ret);
+ 		return ret;
+ 	}

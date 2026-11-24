@@ -175,8 +175,11 @@ if [[ "$PATCHES" == "1" ]]; then
   check "0010 spi RX-before-TX"           "grep -q 'Drain RX before refilling TX' vendor/cix_opensource/kernel/drivers/spi/spi-cadence.c"
   check "0011 cdnsp role/UAF fixes"       "grep -q '!role_changed && cdns->roles' vendor/cix_opensource/kernel/drivers/usb/cdns3/core.c"
   check "0012 scmi perf allowed ops"      "grep -q '!dom->info.set_perf' vendor/cix_opensource/kernel/drivers/firmware/arm_scmi/perf.c"
-  check "0013 dma350 lost-period resync"  "grep -q arm_dma350_cyclic_resync vendor/cix_opensource/kernel/drivers/dma/arm_dma350.c"
+  check "0013 dma350 hw cyclic position"  "grep -q cyc_cmd_addr vendor/cix_opensource/kernel/drivers/dma/arm_dma350.c"
   check "0014 quiet serial console"       "grep -q '^BOARD_KERNEL_CMDLINE += loglevel=4' device/cix/sky1/sky1_orion_o6/BoardConfig.mk"
+  check "0015 hda verb-timeout recovery"  "grep -q snd_hdac_bus_reset_response_counter vendor/cix_opensource/kernel/sound/hda/hdac_bus.c"
+  check "0016 rts5453 shared-irq fixes"   "grep -q 'u8 clear_irq, bool force' vendor/cix_opensource/kernel/drivers/usb/typec/rts5453.c"
+  check "0017 usb d3/suspend fixes"       "grep -q clks_gated vendor/cix_opensource/kernel/drivers/usb/cdns3/cdnsp-sky1.c"
   [[ "$ok" == "1" ]] || die "a patch feature is missing from the build"
 fi
 

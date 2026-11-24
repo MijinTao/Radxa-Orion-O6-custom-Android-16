@@ -1,0 +1,80 @@
+Backport from mainline Linux: 51ee6ce2418 "ALSA: hda: Reset response counter when a verb
+times out" (v7.4). The commit names the CIX HDA controller among those affected.
+
+HDA keeps a per-codec count of commands still waiting for a reply (bus->rirb.cmds[addr]).
+It only goes down when a reply arrives. The CIX HDA controller (hda_cix_ipbloq, ALC256
+codec: the 3.5 mm jack) has no single-command fallback (fallback_to_single_cmd = 0), so
+after one lost reply the driver just returns an error and never resets the bus - the
+count stays at 1 for good and every later command to the codec waits the full 1 s timeout
+and fails, although the codec answers. Seen as: headphone/line-out jack detection and
+volume/mute stop working or take seconds, audio on the 3.5 mm jack stays silent, stream
+start/stop stalls (each one sends several verbs).
+
+Fix: whenever getting a response fails, reset the pending count for that codec address,
+so a late reply is treated as spurious and the next commands work again.
+
+diff --git a/sound/hda/hdac_bus.c b/sound/hda/hdac_bus.c
+index d497414a5..6e6b4da60 100644
+--- a/sound/hda/hdac_bus.c
++++ b/sound/hda/hdac_bus.c
+@@ -124,11 +124,15 @@ int snd_hdac_bus_exec_verb_unlocked(struct hdac_bus *bus, unsigned int addr,
+ 			break;
+ 		/* process pending verbs */
+ 		err = bus->ops->get_response(bus, addr, &tmp);
+-		if (err)
++		if (err) {
++			snd_hdac_bus_reset_response_counter(bus, addr);
+ 			break;
++		}
+ 	}
+ 	if (!err && res) {
+ 		err = bus->ops->get_response(bus, addr, res);
++		if (err)
++			snd_hdac_bus_reset_response_counter(bus, addr);
+ 		trace_hda_get_response(bus, addr, *res);
+ 	}
+ 	return err;
+diff --git a/sound/hda/hdac_controller.c b/sound/hda/hdac_controller.c
+index fc583c98f..125cf6b60 100644
+--- a/sound/hda/hdac_controller.c
++++ b/sound/hda/hdac_controller.c
+@@ -302,6 +302,26 @@ int snd_hdac_bus_get_response(struct hdac_bus *bus, unsigned int addr,
+ }
+ EXPORT_SYMBOL_GPL(snd_hdac_bus_get_response);
+ 
++/**
++ * snd_hdac_bus_reset_response_counter - reset the pending response count
++ * @bus: HD-audio core bus
++ * @addr: codec address
++ *
++ * Drop the number of commands that are still waiting for a response from
++ * the given codec address.  This is called when a verb is known to be dead,
++ * e.g. after a response timeout, so that a lost response won't leave the
++ * counter non-zero forever and block all later verbs to the same codec.
++ */
++void snd_hdac_bus_reset_response_counter(struct hdac_bus *bus, unsigned int addr)
++{
++	if (addr >= HDA_MAX_CODECS)
++		return;
++
++	spin_lock_irq(&bus->reg_lock);
++	bus->rirb.cmds[addr] = 0;
++	spin_unlock_irq(&bus->reg_lock);
++}
++
+ #define HDAC_MAX_CAPS 10
+ /**
+  * snd_hdac_bus_parse_capabilities - parse capability structure
+diff --git a/sound/hda/local.h b/sound/hda/local.h
+index 896ba142e..c45bdb6fa 100644
+--- a/sound/hda/local.h
++++ b/sound/hda/local.h
+@@ -37,6 +37,8 @@ int snd_hdac_bus_add_device(struct hdac_bus *bus, struct hdac_device *codec);
+ void snd_hdac_bus_remove_device(struct hdac_bus *bus,
+ 				struct hdac_device *codec);
+ void snd_hdac_bus_queue_event(struct hdac_bus *bus, u32 res, u32 res_ex);
++void snd_hdac_bus_reset_response_counter(struct hdac_bus *bus,
++					 unsigned int addr);
+ int snd_hdac_bus_exec_verb(struct hdac_bus *bus, unsigned int addr,
+ 			   unsigned int cmd, unsigned int *res);
+ 
