@@ -11,6 +11,7 @@
   .\build.ps1 -O6 -WifiCountry DE    # another Wi-Fi country code (the patches set IT)
   .\build.ps1 -O6 -Cpus 16 -Memory 48 # limit the build container to 16 CPUs and 48 GB of RAM
   .\build.ps1 -O6 -VerboseConsole    # leave out patch 0014: full kernel log on the serial console
+  .\build.ps1 -O6 -AllowModeSwitch   # leave out patch 0018: apps may switch the monitor's display mode
 
   Without -O6 / -O6N it builds the O6. -O6N stops with an explanation: CIX's tree has no O6N device.
   The first run downloads about 90 GB of source into the Docker volume and takes several hours.
@@ -27,11 +28,26 @@ param(
   [int]$Memory = 0,
   [string]$WifiCountry = '',
   [switch]$VerboseConsole,
+  [switch]$AllowModeSwitch,
   [string]$OutputDir = (Join-Path $PSScriptRoot 'output'),
   [string]$Image = 'radxa-o6-android16-builder',
   [string]$SourceVolume = 'radxa-o6-android16-src'
 )
 $ErrorActionPreference = 'Stop'
+
+# Docker must be installed and its engine running; say so plainly instead of failing in 'docker build'.
+if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+  Write-Host 'Docker is not installed (no "docker" command found). Install Docker Desktop, start it and run the build again.' -ForegroundColor Red
+  exit 1
+}
+$ErrorActionPreference = 'Continue'
+docker info *> $null
+$dockerUp = ($LASTEXITCODE -eq 0)
+$ErrorActionPreference = 'Stop'
+if (-not $dockerUp) {
+  Write-Host 'Docker is not running. Start Docker Desktop, wait until it shows "Engine running", then run the build again.' -ForegroundColor Red
+  exit 1
+}
 
 $boards = @()
 if ($O6)  { $boards += 'O6' }
@@ -62,7 +78,10 @@ foreach ($board in $boards) {
   if ($Memory -gt 0) { $limitArgs += @('--memory', "${Memory}g", '--memory-swap', "${Memory}g") }
   if ($limitArgs.Count -gt 0) { Write-Host "Limits: $($limitArgs -join ' ')  jobs: $(if ($buildJobs) { $buildJobs } else { 'all CPUs' })" -ForegroundColor Yellow }
   if ($WifiCountry) { $envArgs += @('-e', "WIFI_COUNTRY=$WifiCountry") }
-  if ($VerboseConsole) { $envArgs += @('-e', 'SKIP_PATCHES=0014'); Write-Host 'Leaving out patch 0014 (quiet serial console)' -ForegroundColor Yellow }
+  $skip = @()
+  if ($VerboseConsole)  { $skip += '0014'; Write-Host 'Leaving out patch 0014 (quiet serial console)' -ForegroundColor Yellow }
+  if ($AllowModeSwitch) { $skip += '0018'; Write-Host 'Leaving out patch 0018 (no display mode switching by apps)' -ForegroundColor Yellow }
+  if ($skip.Count -gt 0) { $envArgs += @('-e', "SKIP_PATCHES=$($skip -join ',')") }
   docker run --rm -t @limitArgs `
     -v "${SourceVolume}:/work" `
     -v "${OutputDir}:/out" `

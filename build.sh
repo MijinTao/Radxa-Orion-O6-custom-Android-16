@@ -9,6 +9,7 @@
 #   ./build.sh --o6 --wifi-country DE  another Wi-Fi country code (the patches set IT)
 #   ./build.sh --o6 --cpus 16 --memory 48   limit the build container to 16 CPUs and 48 GB of RAM
 #   ./build.sh --o6 --verbose-console  leave out patch 0014: full kernel log on the serial console
+#   ./build.sh --o6 --allow-mode-switch  leave out patch 0018: apps may switch the monitor's display mode
 #
 # Without --o6 / --o6n it builds the O6. --o6n stops with an explanation: CIX's tree has no O6N device.
 # Other options: --jobs <n>, --output <dir>. The first run downloads ~90 GB and takes several hours.
@@ -42,12 +43,23 @@ while [[ $# -gt 0 ]]; do
     --memory)       MEMORY="$2"; shift 2 ;;
     --wifi-country) WIFI_COUNTRY="$2"; shift 2 ;;
     --output)       OUTPUT_DIR="$2"; shift 2 ;;
-    --verbose-console) SKIP_PATCHES="0014"; shift ;;
-    -h|--help)      sed -n '2,16p' "$0"; exit 0 ;;
+    --verbose-console) SKIP_PATCHES="${SKIP_PATCHES:+$SKIP_PATCHES,}0014"; shift ;;
+    --allow-mode-switch) SKIP_PATCHES="${SKIP_PATCHES:+$SKIP_PATCHES,}0018"; shift ;;
+    -h|--help)      sed -n '2,17p' "$0"; exit 0 ;;
     *) echo "unknown option: $1 (see --help)" >&2; exit 1 ;;
   esac
 done
 if [[ ${#BOARDS[@]} -eq 0 ]]; then BOARDS=("O6"); echo "No board given: building the Orion O6."; fi
+
+# Docker must be installed and its engine running; say so plainly instead of failing in 'docker build'.
+if ! command -v docker >/dev/null 2>&1; then
+  echo "Docker is not installed (no 'docker' command found). Install Docker, start it and run the build again." >&2
+  exit 1
+fi
+if ! docker info >/dev/null 2>&1; then
+  echo "Docker is not running. Start Docker Desktop (or the docker service: sudo systemctl start docker), then run the build again." >&2
+  exit 1
+fi
 
 mkdir -p "$OUTPUT_DIR"
 OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"

@@ -180,6 +180,7 @@ if [[ "$PATCHES" == "1" ]]; then
   check "0015 hda verb-timeout recovery"  "grep -q snd_hdac_bus_reset_response_counter vendor/cix_opensource/kernel/sound/hda/hdac_bus.c"
   check "0016 rts5453 shared-irq fixes"   "grep -q 'u8 clear_irq, bool force' vendor/cix_opensource/kernel/drivers/usb/typec/rts5453.c"
   check "0017 usb d3/suspend fixes"       "grep -q clks_gated vendor/cix_opensource/kernel/drivers/usb/cdns3/cdnsp-sky1.c"
+  check "0018 no app display-mode switch" "grep -q 'must mean never' frameworks/base/services/core/java/com/android/server/display/mode/DisplayModeDirector.java"
   [[ "$ok" == "1" ]] || die "a patch feature is missing from the build"
 fi
 

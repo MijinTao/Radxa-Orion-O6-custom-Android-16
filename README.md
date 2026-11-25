@@ -2,10 +2,11 @@
 
 Android 16 for the **Radxa Orion O6**, built in Docker from CIX's public Android 16 sources
 ([cixtech/android-manifest](https://github.com/cixtech/android-manifest), branch `cix_android16_2025q3_dev`,
-"Android16 + k6.6 + 2025Q3 Rc4.2") plus seventeen patches: six that make Wi-Fi, Bluetooth and `adb reboot bootloader`
+"Android16 + k6.6 + 2025Q3 Rc4.2") plus eighteen patches: six that make Wi-Fi, Bluetooth and `adb reboot bootloader`
 work, fix the board's freezes and add a mouse-click-as-touch option, six kernel fixes backported from mainline
 Linux, where CIX is upstreaming the P1 (Sky1) drivers (see [Mainline backports](#mainline-backports)), two fixes for DP
-audio turning robotic and then silent, and three more fixes taken from CIX's mainline work (HD audio, USB-C, USB3).
+audio turning robotic and then silent, three more fixes taken from CIX's mainline work (HD audio, USB-C, USB3), and one that stops games switching the
+monitor's display mode (black screen on scene changes).
 
 **Tested on a Radxa Orion O6 with the `Android-1.3.2-dmod` BIOS from
 [Radxa-Orion-O6-custom-BIOS](https://github.com/MijinTao/Radxa-Orion-O6-custom-BIOS). The Orion O6N is not supported (see [Orion O6N](#orion-o6n)).**
@@ -51,6 +52,7 @@ The images end up in **`output/O6-Android16-userdebug/`**. Without a board switc
 | `-Cpus <n>` / `--cpus <n>` | Limit the build container to *n* CPUs (Docker `--cpus`); also sets the jobs to *n* |
 | `-Memory <GB>` / `--memory <GB>` | Limit the build container's RAM to that many GB (Docker `--memory`, no extra swap) |
 | `-VerboseConsole` / `--verbose-console` | Leave out patch 0014: the kernel writes all its messages to the serial console again (to chase a hard freeze over UART; DP audio may break up again) |
+| `-AllowModeSwitch` / `--allow-mode-switch` | Leave out patch 0018: apps and games may switch the monitor's display mode again (upstream behaviour) |
 | `-WifiCountry <XX>` / `--wifi-country <XX>` | Wi-Fi country code (patch 0001 sets `IT`) |
 | `-OutputDir <dir>` / `--output <dir>` | Another output folder (default `output` in the repository) |
 
@@ -140,8 +142,9 @@ every build, so rebuilding always starts clean.
 | 0015 | `hda-reset-response-counter-on-timeout` | kernel | **3.5 mm jack audio that stops responding** (mainline 51ee6ce2418, which names the CIX HDA controller). After one lost codec reply, every later command to the ALC256 codec waited the full 1 s timeout and failed (jack detection, volume, stream start). The pending-reply count is now reset on a timeout. |
 | 0016 | `typec-rts5453-shared-irq-fixes` | kernel | **USB-C ports disturbing each other** (from CIX's pending mainline PD driver, v7). Both RTS5453 PD controllers share one interrupt; every event reprogrammed both ports' orientation switch and USB/DP mux. Now a port is only reprogrammed when its own status changes; pending interrupts are acknowledged at probe/resume; no more status dump per interrupt. |
 | 0017 | `usb-cdnsp-sky1-d3-and-suspend-fixes` | kernel | **USB3 controller power-state fixes** (from CIX's pending mainline glue driver, v9). A failed D3 entry puts the controller back into D0 instead of half way; PME wake-up only when asked for; system suspend only gates the controller clocks once it has really stopped (gating a running controller can hang the bus); the per-autosuspend log lines are debug level. |
+| 0018 | `display-no-app-mode-switch` | `frameworks/base` | **No black screen when a game changes scene.** Games ask Android for another refresh rate (e.g. 30 fps for a menu); with a 4K monitor that also offers 4K at 30/25/24 Hz, Android switched the monitor to that mode, and a monitor goes black for 1–3 s on every mode change. Upstream, "Match content frame rate: Never" (`Settings.Secure match_content_frame_rate 0`) and the min/peak refresh-rate settings can't stop an app's mode request. Now "Never" ignores app mode requests and is the default, so the monitor stays in its preferred mode (e.g. 3840×2160 @ 60 Hz); games still render at whatever frame rate they like. `adb shell settings put secure match_content_frame_rate 2` restores upstream behaviour on a running board; `-AllowModeSwitch` / `--allow-mode-switch` builds without this patch. |
 
-All patches together change 34 files; the build checks that each one is in the result (kernel config, drivers,
+All patches together change 35 files; the build checks that each one is in the result (kernel config, drivers,
 firmware, the input library) and stops if one is missing.
 
 ## Mainline backports

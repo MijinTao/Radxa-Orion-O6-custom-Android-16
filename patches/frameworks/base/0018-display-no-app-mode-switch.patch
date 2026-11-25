@@ -1,0 +1,55 @@
+display: "Match content frame rate: Never" stops apps switching the display mode, and is the default
+
+On a DP/HDMI monitor every display mode change is a full link re-sync: the screen goes black for
+1-3 s. Games often ask for another refresh rate when they change scene (for example 30 fps for a
+menu), and with a 4K60 monitor that offers 4K30/25/24 too, Android switched the monitor to 4K30
+and back each time.
+
+Upstream, Settings.Secure.match_content_frame_rate = 0 ("Never", SWITCHING_TYPE_NONE) only pins
+the refresh-rate ranges to the base mode after the base mode has been chosen, and the base mode
+is still chosen from the app's preferredDisplayModeId / preferredRefreshRate vote. The user's
+min/peak refresh-rate settings rank below that vote, so nothing a user can set stops it.
+
+With SWITCHING_TYPE_NONE the app-request votes (render range, base mode, size) are now ignored,
+and NONE is the default when the setting has never been written, so the display stays in its
+default mode (the monitor's preferred one, e.g. 3840x2160@60). Apps still render at the frame
+rate they want; only the monitor mode stays fixed.
+
+To let apps switch modes again on a running board:
+  adb shell settings put secure match_content_frame_rate 1   (seamless only)
+  adb shell settings put secure match_content_frame_rate 2   (always, upstream behaviour)
+Build without this patch: build.ps1 -AllowModeSwitch / build.sh --allow-mode-switch.
+
+diff --git a/services/core/java/com/android/server/display/mode/DisplayModeDirector.java b/services/core/java/com/android/server/display/mode/DisplayModeDirector.java
+index 2c90e19..b579545 100644
+--- a/services/core/java/com/android/server/display/mode/DisplayModeDirector.java
++++ b/services/core/java/com/android/server/display/mode/DisplayModeDirector.java
+@@ -177,8 +177,11 @@ public class DisplayModeDirector {
+     /**
+      * The allowed refresh rate switching type. This is used by SurfaceFlinger.
+      */
++    // ORION_O6: default to "Match content frame rate: Never". On a monitor every display mode
++    // change is a full DP/HDMI re-sync (the screen goes black for 1-3 s), so apps should not be
++    // able to switch modes unless the user opts in (settings put secure match_content_frame_rate 1).
+     @DisplayManager.SwitchingType
+-    private int mModeSwitchingType = DisplayManager.SWITCHING_TYPE_WITHIN_GROUPS;
++    private int mModeSwitchingType = DisplayManager.SWITCHING_TYPE_NONE;
+ 
+     /**
+      * Whether resolution range voting feature is enabled.
+@@ -323,6 +326,15 @@ public class DisplayModeDirector {
+     public DesiredDisplayModeSpecs getDesiredDisplayModeSpecs(int displayId) {
+         synchronized (mLock) {
+             SparseArray<Vote> votes = mVotesStorage.getVotes(displayId);
++            if (mModeSwitchingType == DisplayManager.SWITCHING_TYPE_NONE) {
++                // ORION_O6: "Never" must mean never. Upstream still lets an app's
++                // preferredDisplayModeId / preferredRefreshRate pick the base mode and only pins
++                // the refresh-rate ranges to it afterwards, so a game asking for 30 fps switches
++                // a 4K60 monitor to 4K30. Drop the app-request votes (getVotes returns a copy).
++                votes.remove(Vote.PRIORITY_APP_REQUEST_RENDER_FRAME_RATE_RANGE);
++                votes.remove(Vote.PRIORITY_APP_REQUEST_BASE_MODE_REFRESH_RATE);
++                votes.remove(Vote.PRIORITY_APP_REQUEST_SIZE);
++            }
+             Display.Mode[] modes = mSupportedModesByDisplay.get(displayId);
+             Display.Mode defaultMode = mDefaultModeByDisplay.get(displayId);
+             if (modes == null || defaultMode == null) {
